@@ -24,7 +24,7 @@ def _norm_time_utc(df: pd.DataFrame, col: str = "time") -> pd.DataFrame:
 # Config (adjust as needed)
 # --------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TARGET_ID    = "HGV_00010"                  # folder name under OUTPUT_LOS_VECTORS
+TARGET_ID    = "HGV_00006"                  # folder name under OUTPUT_LOS_VECTORS
 LOS_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_LOS_VECTORS" / TARGET_ID
 EPH_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_EPHEM"
 OUT_DIR      = PROJECT_ROOT / "exports" / "triangulation"
@@ -38,7 +38,7 @@ OEM_PATH = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM" / f"{TARGE
 # TIME_TOL_S   = 31.0  # commented out, not needed
 
 # Noise model
-SIGMA_LOS    = 1000e-6     # rad (≈1 mrad)
+SIGMA_LOS    = 100e-6     # rad (≈1 mrad)
 DO_MONTE_CARLO = True
 MC_SAMPLES     = 200
 MC_SEED        = 12345
@@ -109,6 +109,40 @@ def read_oem_ccsds(path: Path) -> pd.DataFrame:
 def _exact_join(los_df: pd.DataFrame, eph_df: pd.DataFrame) -> pd.DataFrame:
     j = pd.merge(los_df, eph_df, on="time", how="inner")
     return j.dropna()
+
+def interp_ephem_to_times(eph: pd.DataFrame, times_utc: pd.Series) -> pd.DataFrame:
+    """
+    Interpolate ephemeris (x_km, y_km, z_km) to the provided UTC times using time-based interpolation.
+    Inputs:
+      eph: DataFrame with columns ["time","x_km","y_km","z_km"] (UTC tz-aware)
+      times_utc: pandas Series/Index of UTC timestamps (tz-aware)
+    Returns:
+      DataFrame indexed by the provided times with columns ["x_km","y_km","z_km"].
+      Rows outside eph time span are dropped.
+    """
+    if eph.empty or len(times_utc) == 0:
+        return pd.DataFrame(columns=["x_km","y_km","z_km"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+
+    # Ensure monotonic time index for interpolation
+    e = eph.copy()
+    if "time" in e.columns:
+        e = e.set_index("time")
+    e = e.sort_index()
+
+    # Keep only within eph span to avoid extrapolation
+    t0, t1 = e.index.min(), e.index.max()
+    times = pd.to_datetime(times_utc, utc=True)
+    mask = (times >= t0) & (times <= t1)
+    times_in = times[mask]
+    if len(times_in) == 0:
+        return pd.DataFrame(columns=["x_km","y_km","z_km"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+
+    # Reindex to desired times and interpolate each column in time
+    e_re = e.reindex(e.index.union(times_in)).sort_index()
+    e_int = e_re.interpolate(method="time")[ ["x_km","y_km","z_km"] ]
+    out = e_int.loc[times_in]
+    out.index.name = "time"
+    return out
 
 # --------------------------
 # Geometry core
@@ -234,25 +268,27 @@ def main():
         t0, t1 = truth_df.index.min(), truth_df.index.max()
         los = los[(los["time"] >= t0) & (los["time"] <= t1)]
         eph = eph[(eph["time"] >= t0) & (eph["time"] <= t1)]
-        # Nearest-time join between LOS (left) and EPH (right); keep LOS time as reference
-        los2 = los.sort_values("time").rename(columns={"time": "time_l"})
-        eph2 = eph.sort_values("time").rename(columns={"time": "time_r"})
-        j = pd.merge_asof(
-            los2, eph2,
-            left_on="time_l", right_on="time_r",
-            direction="nearest", tolerance=pd.Timedelta(seconds=31)
-        ).dropna()
-        if j.empty:
-            print(f"[JOIN] OBS {obs}: 0 matches within ±31s in OEM window — skipping")
+
+        # Interpolate EPH at LOS timestamps (exact time alignment, no nearest bias)
+        los_sorted = los.sort_values("time")
+        eph_int = interp_ephem_to_times(eph, los_sorted["time"])  # indexed by LOS times (subset within eph span)
+        if eph_int.empty:
+            print(f"[JOIN] OBS {obs}: 0 rows after ephem interpolation to LOS times — skipping")
             continue
-        # Normalize columns for downstream use and round LOS time to whole seconds
-        j.rename(columns={"time_l": "time"}, inplace=True)
-        j = _norm_time_utc(j, col="time")
-        # Keep LOS unit vectors and EPH position
-        keep_cols = ["time", "ux", "uy", "uz", "x_km", "y_km", "z_km"]
-        aligned_df = j[keep_cols].sort_values("time").set_index("time")
+        # Build aligned DF at the common times (intersection after trimming by eph span)
+        common_times = eph_int.index
+        los_aln = los_sorted.set_index("time").loc[common_times]
+        aligned_df = pd.DataFrame({
+            "ux": los_aln["ux"].astype(float),
+            "uy": los_aln["uy"].astype(float),
+            "uz": los_aln["uz"].astype(float),
+            "x_km": eph_int["x_km"].astype(float),
+            "y_km": eph_int["y_km"].astype(float),
+            "z_km": eph_int["z_km"].astype(float),
+        }, index=common_times)
+        aligned_df.index.name = "time"
         aligned[obs] = aligned_df
-        print(f"[JOIN] OBS {obs}: {len(aligned_df)} matched rows (±31s) in OEM window")
+        print(f"[JOIN] OBS {obs}: {len(aligned_df)} rows (EPH interpolated to LOS times in OEM window)")
 
     # Use OEM timeline as master epochs
     master_index = truth_df.index
