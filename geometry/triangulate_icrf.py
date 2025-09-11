@@ -24,7 +24,7 @@ def _norm_time_utc(df: pd.DataFrame, col: str = "time") -> pd.DataFrame:
 # Config (adjust as needed)
 # --------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TARGET_ID    = "HGV_00004"                  # folder name under OUTPUT_LOS_VECTORS
+TARGET_ID    = "HGV_00010"                  # folder name under OUTPUT_LOS_VECTORS
 LOS_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_LOS_VECTORS" / TARGET_ID
 EPH_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_EPHEM"
 OUT_DIR      = PROJECT_ROOT / "exports" / "triangulation"
