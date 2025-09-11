@@ -9,11 +9,12 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
+from matplotlib import cm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRI_DIR      = PROJECT_ROOT / "exports" / "triangulation"
 # If you want a specific file, set it here; otherwise newest matching file will be used.
-TRI_CSV_PATH = TRI_DIR / "xhat_geo_36sats_HGV_00010.csv"
+TRI_CSV_PATH = TRI_DIR / "xhat_geo_36sats_HGV_00006.csv"
 
 # Plot knobs
 DOTS_PER_EPOCH      = 100
@@ -76,15 +77,19 @@ def _read_triangulation(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     # parse ISO times
     df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    need = [
+    core = [
         "time",
         "xhat_x_km","xhat_y_km","xhat_z_km",
         "Sigma_xx","Sigma_yy","Sigma_zz",
         "Sigma_xy","Sigma_xz","Sigma_yz",
     ]
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        raise ValueError(f"Triangulation CSV missing columns: {missing}")
+    opt  = ["CEP50_km_analytic","err_x_km","err_y_km","err_z_km","err_norm_km"]
+    missing_core = [c for c in core if c not in df.columns]
+    if missing_core:
+        raise ValueError(f"Triangulation CSV missing columns: {missing_core}")
+    # keep available optional columns
+    cols = core + [c for c in opt if c in df.columns]
+    df = df[cols + (["time"] if "time" not in cols else [])]
     return df.dropna(subset=["time"]).sort_values("time")
 
 
@@ -119,6 +124,27 @@ def _set_equal_3d(ax: Axes, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray):
     ax.set_zlim(centers[2]-R, centers[2]+R)
 
 
+def _draw_cov_ellipsoid(ax: Axes, center: np.ndarray, Sigma: np.ndarray, scale: float = 1.0, n_u: int = 12, n_v: int = 12):
+    # Eigen-decomposition
+    vals, vecs = np.linalg.eigh(Sigma)
+    vals = np.maximum(vals, 0.0)
+    radii = scale * np.sqrt(vals)
+    # Parametric sphere
+    u = np.linspace(0, 2*np.pi, n_u)
+    v = np.linspace(0, np.pi, n_v)
+    xs = np.outer(np.cos(u), np.sin(v))
+    ys = np.outer(np.sin(u), np.sin(v))
+    zs = np.outer(np.ones_like(u), np.cos(v))
+    # Scale
+    E = np.stack([radii[0]*xs, radii[1]*ys, radii[2]*zs], axis=0).reshape(3, -1)
+    # Rotate
+    E = (vecs @ E).reshape(3, xs.shape[0], xs.shape[1])
+    X = E[0] + center[0]
+    Y = E[1] + center[1]
+    Z = E[2] + center[2]
+    ax.plot_wireframe(X, Y, Z, linewidth=0.6, rstride=1, cstride=1, alpha=0.3)
+
+
 # --- Main ---
 
 def main():
@@ -139,6 +165,8 @@ def main():
     # ranges sanity
     print(f"[RANGE] Truth xyz [km]: x[{truth['x_km'].min():.1f},{truth['x_km'].max():.1f}] y[{truth['y_km'].min():.1f},{truth['y_km'].max():.1f}] z[{truth['z_km'].min():.1f},{truth['z_km'].max():.1f}]")
     print(f"[RANGE] x̂    xyz [km]: x[{tri['xhat_x_km'].min():.1f},{tri['xhat_x_km'].max():.1f}] y[{tri['xhat_y_km'].min():.1f},{tri['xhat_y_km'].max():.1f}] z[{tri['xhat_z_km'].min():.1f},{tri['xhat_z_km'].max():.1f}]")
+
+    cep_vals = tri["CEP50_km_analytic"].to_numpy() if "CEP50_km_analytic" in tri.columns else None
 
     # Build MC dots centered on x̂
     rng = np.random.default_rng(RNG_SEED)
@@ -161,11 +189,24 @@ def main():
 
     # Triangulated fixes
     if len(xhat_pts):
-        ax.scatter(xhat_pts[:,0], xhat_pts[:,1], xhat_pts[:,2], s=14, marker='x', label="triangulated x̂", depthshade=False)
+        if cep_vals is not None:
+            sc = ax.scatter(xhat_pts[:,0], xhat_pts[:,1], xhat_pts[:,2], s=14, marker='x', c=cep_vals, cmap=cm.viridis, depthshade=False, label="triangulated x̂ (colored by CEP50)")
+            cbar = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.05)
+            cbar.set_label("CEP50 [km]")
+        else:
+            ax.scatter(xhat_pts[:,0], xhat_pts[:,1], xhat_pts[:,2], s=14, marker='x', label="triangulated x̂", depthshade=False)
 
     # MC dots
     if len(dots_all):
         ax.scatter(dots_all[:,0], dots_all[:,1], dots_all[:,2], s=3, alpha=0.12, label="MC samples", depthshade=False)
+
+    # Draw a few covariance ellipsoids (1-sigma) subsampled along the track
+    if len(tri) > 0:
+        step = max(1, len(tri)//12)
+        for _, row in tri.iloc[::step].iterrows():
+            mu = np.array([row["xhat_x_km"], row["xhat_y_km"], row["xhat_z_km"]], dtype=float)
+            S  = _cov_from_row(row)
+            _draw_cov_ellipsoid(ax, mu, S, scale=1.0, n_u=10, n_v=10)
 
     ax.set_xlabel("x [km]")
     ax.set_ylabel("y [km]")
@@ -176,6 +217,45 @@ def main():
     _set_equal_3d(ax, truth["x_km"].to_numpy(), truth["y_km"].to_numpy(), truth["z_km"].to_numpy())
 
     plt.tight_layout()
+
+    # --- Error time series (abs error per axis) ---
+    if all(c in tri.columns for c in ("err_x_km","err_y_km","err_z_km")):
+        mx, sx = float(tri["err_x_km"].mean()), float(tri["err_x_km"].std())
+        my, sy = float(tri["err_y_km"].mean()), float(tri["err_y_km"].std())
+        mz, sz = float(tri["err_z_km"].mean()), float(tri["err_z_km"].std())
+        print(f"[STATS] err_x mean={mx:.3f} km, std={sx:.3f} km")
+        print(f"[STATS] err_y mean={my:.3f} km, std={sy:.3f} km")
+        print(f"[STATS] err_z mean={mz:.3f} km, std={sz:.3f} km")
+
+        t = tri["time"]
+
+        ex = (tri["err_x_km"] - mx).abs()
+        ey = (tri["err_y_km"] - my).abs()
+        ez = (tri["err_z_km"] - mz).abs()
+        # RMSE over available epochs
+        rx = float(np.sqrt(np.nanmean((tri["err_x_km"])**2)))
+        ry = float(np.sqrt(np.nanmean((tri["err_y_km"])**2)))
+        rz = float(np.sqrt(np.nanmean((tri["err_z_km"])**2)))
+
+        if "Nsats" in tri.columns:
+            fig_sc, ax_sc = plt.subplots(figsize=(5,4))
+            ax_sc.scatter(tri["Nsats"], tri["err_y_km"].abs(), s=10, alpha=0.6)
+            ax_sc.set_xlabel("Nsats")
+            ax_sc.set_ylabel("|err_y| [km]")
+            ax_sc.set_title("|err_y| vs Nsats")
+            ax_sc.grid(True, linestyle=":", alpha=0.6)
+
+        fig2, ax2 = plt.subplots(figsize=(10, 3.6))
+        ax2.plot(t, ex, label=f"|err_x| (RMSE={rx:.2f} km)")
+        ax2.plot(t, ey, label=f"|err_y| (RMSE={ry:.2f} km)")
+        ax2.plot(t, ez, label=f"|err_z| (RMSE={rz:.2f} km)")
+        ax2.set_ylabel("|error| [km]")
+        ax2.set_xlabel("time [UTC]")
+        ax2.set_title("Per-axis absolute error and RMSE")
+        ax2.grid(True, linestyle=":", alpha=0.6)
+        ax2.legend(loc="upper right")
+        fig2.autofmt_xdate()
+
     plt.show()
 
 
