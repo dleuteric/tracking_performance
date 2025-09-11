@@ -13,7 +13,7 @@ from matplotlib.axes import Axes
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRI_DIR      = PROJECT_ROOT / "exports" / "triangulation"
 # If you want a specific file, set it here; otherwise newest matching file will be used.
-TRI_CSV_PATH = None  # e.g., TRI_DIR / "xhat_geo_36sats_HGV_00001.csv"
+TRI_CSV_PATH = TRI_DIR / "xhat_geo_36sats_HGV_00003.csv"
 
 # Plot knobs
 DOTS_PER_EPOCH      = 100
