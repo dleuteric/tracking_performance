@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import numpy as np
 import pandas as pd
+import time
 
 # --- Time normalization helper ---
 
@@ -24,7 +25,7 @@ def _norm_time_utc(df: pd.DataFrame, col: str = "time") -> pd.DataFrame:
 # Config (adjust as needed)
 # --------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TARGET_ID    = "HGV_00006"                  # folder name under OUTPUT_LOS_VECTORS
+TARGET_ID    = "HGV_00010"                  # folder name under OUTPUT_LOS_VECTORS
 LOS_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_LOS_VECTORS" / TARGET_ID
 EPH_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_EPHEM"
 OUT_DIR      = PROJECT_ROOT / "exports" / "triangulation"
@@ -38,11 +39,22 @@ OEM_PATH = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM" / f"{TARGE
 # TIME_TOL_S   = 31.0  # commented out, not needed
 
 # Noise model
-SIGMA_LOS    = 100e-6     # rad
+SIGMA_LOS    = 250e-6     # rad
 DO_MONTE_CARLO = True
-MC_SAMPLES     = 200
+MC_SAMPLES     = 50
 MC_SEED        = 12345
 
+# Visibility gate (optional). Set VISIBILITY_GATE=False if STK already applied access filtering.
+VISIBILITY_GATE   = False
+ELEV_MASK_DEG     = 5.0    # used only if VISIBILITY_GATE=True
+USE_OCCLUSION_CHECK = True # used only if VISIBILITY_GATE=True
+R_EARTH_KM        = 6378.137
+
+# Performance / diagnostics knobs
+MC_EVERY            = 20     # compute MC CEP only every Nth epoch (set 1 for every epoch)
+BETA_PAIRS_MODE     = "summary"  # "full" | "summary" | "none"
+BETA_SUMMARY_K      = 5      # when summary, include top-K widest and top-K narrowest pairs
+PROGRESS_EVERY      = 100    # print progress every N epochs
 # --------------------------
 # Helpers: header normalization & file readers
 # --------------------------
@@ -144,6 +156,39 @@ def interp_ephem_to_times(eph: pd.DataFrame, times_utc: pd.Series) -> pd.DataFra
     out.index.name = "time"
     return out
 
+# --- Interpolate LOS to times helper ---
+def interp_los_to_times(los: pd.DataFrame, times_utc: pd.DatetimeIndex | pd.Series) -> pd.DataFrame:
+    """Interpolate LOS components (ux,uy,uz) to provided UTC times using time interpolation.
+    Returns DataFrame indexed by the provided times with columns ux,uy,uz (unit-normalized).
+    Out-of-span times are dropped.
+    """
+    if los.empty or len(times_utc) == 0:
+        return pd.DataFrame(columns=["ux","uy","uz"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    L = los.copy()
+    if "time" in L.columns:
+        L = L.set_index("time")
+    L = L.sort_index()
+
+    # Only interpolate within LOS span
+    t0, t1 = L.index.min(), L.index.max()
+    times = pd.to_datetime(times_utc, utc=True)
+    mask = (times >= t0) & (times <= t1)
+    times_in = times[mask]
+    if len(times_in) == 0:
+        return pd.DataFrame(columns=["ux","uy","uz"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+
+    Lre = L.reindex(L.index.union(times_in)).sort_index()
+    U = Lre.interpolate(method="time")[ ["ux","uy","uz"] ]
+    U = U.loc[times_in]
+    # re-normalize rows to unit vectors
+    arr = U.to_numpy(float)
+    n = np.linalg.norm(arr, axis=1, keepdims=True)
+    n[n == 0.0] = 1.0
+    arr = arr / n
+    U.loc[:, ["ux","uy","uz"]] = arr
+    U.index.name = "time"
+    return U
+
 # --------------------------
 # Geometry core
 # --------------------------
@@ -188,28 +233,56 @@ def covariance_geo(x_hat: np.ndarray, rs: list[np.ndarray], us: list[np.ndarray]
 # --- Baseline angle helper ---
 from itertools import combinations
 
-def baseline_angles_deg(us: list[np.ndarray], obs_ids: list[str]) -> tuple[float, float, float, str]:
+def baseline_angles_deg(us: list[np.ndarray], obs_ids: list[str],
+                        mode: str = "summary", k: int = 5) -> tuple[float, float, float, str]:
     """
     Compute pairwise baseline angles between LOS unit vectors.
     Returns (beta_min_deg, beta_max_deg, beta_mean_deg, pairs_str)
     where pairs_str encodes angles as "idA-idB:angle" joined by '|'.
+    mode: "full" returns all pairs; "summary" returns k smallest and k largest; "none" returns empty string.
     """
     if len(us) < 2:
         return (np.nan, np.nan, np.nan, "")
-    betas = []
-    labels = []
+    pairs = []
     for (i, j) in combinations(range(len(us)), 2):
         ui = us[i]; uj = us[j]
         c = float(np.clip(ui.dot(uj), -1.0, 1.0))
         ang = float(np.degrees(np.arccos(c)))
-        betas.append(ang)
-        labels.append(f"{obs_ids[i]}-{obs_ids[j]}:{ang:.2f}")
-    betas = np.array(betas, dtype=float)
+        pairs.append((ang, obs_ids[i], obs_ids[j]))
+    betas = np.array([p[0] for p in pairs], dtype=float)
     beta_min = float(np.min(betas))
     beta_max = float(np.max(betas))
     beta_mean = float(np.mean(betas))
-    pairs_str = "|".join(labels)
-    return beta_min, beta_max, beta_mean, pairs_str
+
+    if mode == "none":
+        return beta_min, beta_max, beta_mean, ""
+
+    if mode == "full":
+        labels = [f"{a}-{b}:{ang:.2f}" for ang, a, b in pairs]
+        return beta_min, beta_max, beta_mean, "|".join(labels)
+
+    # summary mode: top-k smallest and largest
+    idx_sorted = np.argsort(betas)
+    idx_take = list(idx_sorted[:k]) + list(idx_sorted[-k:]) if len(idx_sorted) > k else list(idx_sorted)
+    labels = [f"{pairs[i][1]}-{pairs[i][2]}:{pairs[i][0]:.2f}" for i in idx_take]
+    return beta_min, beta_max, beta_mean, "|".join(labels)
+
+def is_visible(r_km: np.ndarray, u_hat: np.ndarray, elev_mask_deg: float, use_occlusion: bool) -> bool:
+    """Return True if LOS from satellite position r_km along u_hat is above elevation mask
+    and (optionally) not Earth-occluded. Elevation is asin(u·up), where up = r/|r|.
+    """
+    # elevation
+    up = r_km / np.linalg.norm(r_km)
+    elev_rad = np.arcsin(float(np.clip(u_hat.dot(up), -1.0, 1.0)))
+    if np.degrees(elev_rad) < elev_mask_deg:
+        return False
+    if use_occlusion:
+        rs2 = float(r_km.dot(r_km))
+        proj = float(r_km.dot(u_hat))
+        d_min = np.sqrt(max(rs2 - proj*proj, 0.0))
+        if d_min <= R_EARTH_KM:
+            return False
+    return True
 
 def cep50_from_cov2d(Sigma: np.ndarray) -> float:
     Sxy = Sigma[:2,:2]
@@ -283,6 +356,9 @@ def main():
     obs_list = all_obs  # use all; gate per-epoch with N_OBSERVERS
     print(f"[USE ] Observers selected: {obs_list}")
 
+    master_index = truth_df.index
+    print(f"[SYNC] Master epochs from OEM: {len(master_index)}")
+    print(f"[CFG ] VISIBILITY_GATE={VISIBILITY_GATE} (mask={ELEV_MASK_DEG} deg, occlusion={USE_OCCLUSION_CHECK})")
     aligned = {}
     for obs in obs_list:
         los = _load_los_for_obs(obs)
@@ -295,35 +371,31 @@ def main():
         los = los[(los["time"] >= t0) & (los["time"] <= t1)]
         eph = eph[(eph["time"] >= t0) & (eph["time"] <= t1)]
 
-        # Interpolate EPH at LOS timestamps (exact time alignment, no nearest bias)
-        los_sorted = los.sort_values("time")
-        eph_int = interp_ephem_to_times(eph, los_sorted["time"])  # indexed by LOS times (subset within eph span)
-        if eph_int.empty:
-            print(f"[JOIN] OBS {obs}: 0 rows after ephem interpolation to LOS times — skipping")
+        # Interpolate both EPHEM and LOS to the OEM master epochs (exact simultaneity)
+        eph_int = interp_ephem_to_times(eph, master_index)
+        los_int = interp_los_to_times(los, master_index)
+        # intersect to avoid extrapolation edges
+        common = eph_int.index.intersection(los_int.index)
+        if len(common) == 0:
+            print(f"[JOIN] OBS {obs}: 0 rows after interpolation to OEM epochs — skipping")
             continue
-        # Build aligned DF at the common times (intersection after trimming by eph span)
-        common_times = eph_int.index
-        los_aln = los_sorted.set_index("time").loc[common_times]
         aligned_df = pd.DataFrame({
-            "ux": los_aln["ux"].astype(float),
-            "uy": los_aln["uy"].astype(float),
-            "uz": los_aln["uz"].astype(float),
-            "x_km": eph_int["x_km"].astype(float),
-            "y_km": eph_int["y_km"].astype(float),
-            "z_km": eph_int["z_km"].astype(float),
-        }, index=common_times)
+            "ux": los_int.loc[common, "ux"].astype(float),
+            "uy": los_int.loc[common, "uy"].astype(float),
+            "uz": los_int.loc[common, "uz"].astype(float),
+            "x_km": eph_int.loc[common, "x_km"].astype(float),
+            "y_km": eph_int.loc[common, "y_km"].astype(float),
+            "z_km": eph_int.loc[common, "z_km"].astype(float),
+        }, index=common)
         aligned_df.index.name = "time"
         aligned[obs] = aligned_df
-        print(f"[JOIN] OBS {obs}: {len(aligned_df)} rows (EPH interpolated to LOS times in OEM window)")
-
-    # Use OEM timeline as master epochs
-    master_index = truth_df.index
-    print(f"[SYNC] Master epochs from OEM: {len(master_index)}")
+        print(f"[JOIN] OBS {obs}: {len(aligned_df)} rows (interpolated to OEM epochs)")
 
     rng = np.random.default_rng(MC_SEED)
     rows = []
     kept = skipped = 0
-    for tstamp in master_index:
+    t_start = time.time()
+    for idx, tstamp in enumerate(master_index):
         rs, us, used_obs = [], [], []
         for obs in obs_list:
             df_obs = aligned.get(obs)
@@ -332,12 +404,19 @@ def main():
             if tstamp in df_obs.index:
                 row = df_obs.loc[tstamp]
                 r = np.array([row["x_km"], row["y_km"], row["z_km"]], dtype=float)
-                u = np.array([row["ux"],   row["uy"],   row["uz"]],   dtype=float)
+                u = np.array([row["ux"], row["uy"], row["uz"]], dtype=float)
                 u = u / np.linalg.norm(u)
+                if VISIBILITY_GATE:
+                    if not is_visible(r, u, ELEV_MASK_DEG, USE_OCCLUSION_CHECK):
+                        continue  # gated out by elevation/occlusion
                 rs.append(r); us.append(u); used_obs.append(obs)
         if len(us) < N_OBSERVERS:
             skipped += 1
             continue
+
+        if (idx % PROGRESS_EVERY) == 0:
+            elapsed = time.time() - t_start
+            print(f"[PROG] epoch {idx+1}/{len(master_index)} | kept={kept} skipped={skipped} | elapsed={elapsed:.1f}s")
 
         kept += 1
         x_hat, condA = triangulate_epoch(rs, us)
@@ -346,7 +425,8 @@ def main():
             x_hat, condA = triangulate_epoch(rs, us_fixed)
             us = us_fixed
         # Baseline angle metrics (geometry hooks)
-        beta_min_deg, beta_max_deg, beta_mean_deg, beta_pairs_deg = baseline_angles_deg(us, used_obs)
+        beta_min_deg, beta_max_deg, beta_mean_deg, beta_pairs_deg = baseline_angles_deg(
+            us, used_obs, mode=BETA_PAIRS_MODE, k=BETA_SUMMARY_K)
 
         Sigma = covariance_geo(x_hat, rs, us, SIGMA_LOS)
         cep50_km = cep50_from_cov2d(Sigma)
@@ -363,9 +443,9 @@ def main():
         err_x, err_y, err_z = diff.tolist()
         err_norm = float(np.linalg.norm(diff))
 
-        # Optional MC check
+        # Optional MC check (downsampled by MC_EVERY)
         mc_cep = np.nan
-        if DO_MONTE_CARLO:
+        if DO_MONTE_CARLO and (idx % MC_EVERY == 0):
             X = []
             for _ in range(MC_SAMPLES):
                 us_p = [perturb_los(u, SIGMA_LOS, rng) for u in us]
