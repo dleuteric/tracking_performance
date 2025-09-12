@@ -38,7 +38,7 @@ OEM_PATH = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM" / f"{TARGE
 # TIME_TOL_S   = 31.0  # commented out, not needed
 
 # Noise model
-SIGMA_LOS    = 100e-6     # rad (≈1 mrad)
+SIGMA_LOS    = 100e-6     # rad
 DO_MONTE_CARLO = True
 MC_SAMPLES     = 200
 MC_SEED        = 12345
