@@ -185,6 +185,32 @@ def covariance_geo(x_hat: np.ndarray, rs: list[np.ndarray], us: list[np.ndarray]
         G = G + 1e-12*np.eye(3)
     return (sigma_los**2) * np.linalg.inv(G)
 
+# --- Baseline angle helper ---
+from itertools import combinations
+
+def baseline_angles_deg(us: list[np.ndarray], obs_ids: list[str]) -> tuple[float, float, float, str]:
+    """
+    Compute pairwise baseline angles between LOS unit vectors.
+    Returns (beta_min_deg, beta_max_deg, beta_mean_deg, pairs_str)
+    where pairs_str encodes angles as "idA-idB:angle" joined by '|'.
+    """
+    if len(us) < 2:
+        return (np.nan, np.nan, np.nan, "")
+    betas = []
+    labels = []
+    for (i, j) in combinations(range(len(us)), 2):
+        ui = us[i]; uj = us[j]
+        c = float(np.clip(ui.dot(uj), -1.0, 1.0))
+        ang = float(np.degrees(np.arccos(c)))
+        betas.append(ang)
+        labels.append(f"{obs_ids[i]}-{obs_ids[j]}:{ang:.2f}")
+    betas = np.array(betas, dtype=float)
+    beta_min = float(np.min(betas))
+    beta_max = float(np.max(betas))
+    beta_mean = float(np.mean(betas))
+    pairs_str = "|".join(labels)
+    return beta_min, beta_max, beta_mean, pairs_str
+
 def cep50_from_cov2d(Sigma: np.ndarray) -> float:
     Sxy = Sigma[:2,:2]
     sigma_eq = np.sqrt(0.5*np.trace(Sxy))
@@ -319,6 +345,9 @@ def main():
         if flips > 0:
             x_hat, condA = triangulate_epoch(rs, us_fixed)
             us = us_fixed
+        # Baseline angle metrics (geometry hooks)
+        beta_min_deg, beta_max_deg, beta_mean_deg, beta_pairs_deg = baseline_angles_deg(us, used_obs)
+
         Sigma = covariance_geo(x_hat, rs, us, SIGMA_LOS)
         cep50_km = cep50_from_cov2d(Sigma)
 
@@ -359,6 +388,10 @@ def main():
             "perp_residual_mean_km": perp_mean,
             "obs_used_csv": ",".join(used_obs),
             "err_x_km": err_x, "err_y_km": err_y, "err_z_km": err_z, "err_norm_km": err_norm,
+            "beta_min_deg": beta_min_deg,
+            "beta_max_deg": beta_max_deg,
+            "beta_mean_deg": beta_mean_deg,
+            "beta_pairs_deg": beta_pairs_deg,
         })
     print(f"[GATE] N_OBSERVERS>={N_OBSERVERS} | kept {kept} epochs, skipped {skipped}")
 
