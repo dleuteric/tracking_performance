@@ -14,13 +14,24 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib import cm
 
-from exports.triangulation.plot_performance_metrics import TRI_DIR
+import os
+import uuid
+from datetime import datetime
+
+from matplotlib.backends.backend_pdf import PdfPages
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRI_DIR      = PROJECT_ROOT / "exports" / "triangulation"
-TRI_CSV_PATH = TRI_DIR / 'xhat_geo_HGV_00010.csv'  # if None, newest xhat_geo_*sats_*.csv will be used
+TRI_CSV_PATH = None  # if None, loop all xhat_geo_*.csv in TRI_DIR
 PLOT_DIR     = PROJECT_ROOT / "plots"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Run stamping: create a unique folder per plotting run
+RUN_ID = os.environ.get("RUN_ID") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8]
+RUN_DIR = PLOT_DIR / RUN_ID
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+print(f"[RUN ] Plot run id: {RUN_ID}")
+print(f"[OUT ] Plot directory: {RUN_DIR}")
 
 # knobs
 DOTS_PER_EPOCH      = 60
@@ -31,12 +42,11 @@ RNG_SEED            = 7
 
 # ---------------- helpers ----------------
 
-def _find_triangulation_csv(tri_dir: Path) -> Path:
-    cands = sorted(tri_dir.glob("xhat_geo_*sats_*.csv"))
+def _find_triangulation_csvs(tri_dir: Path) -> list[Path]:
+    cands = sorted(tri_dir.glob("xhat_geo_*.csv"))
     if not cands:
         raise FileNotFoundError(f"No triangulation CSVs in {tri_dir}")
-    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return cands[0]
+    return cands
 
 
 def _read_oem_ccsds(path: Path) -> pd.DataFrame:
@@ -161,22 +171,12 @@ def _compute_derived(tri: pd.DataFrame) -> pd.DataFrame:
     return tri
 
 
-# ---------------- main ----------------
 
-def main():
-    tri_csv = TRI_CSV_PATH or _find_triangulation_csv(TRI_DIR)
-    m = re.search(r"HGV_\d+", tri_csv.name)
-    if not m:
-        raise RuntimeError(f"Could not infer TARGET_ID from {tri_csv.name}")
-    target_id = m.group(0)
-    oem_path = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM" / f"{target_id}.oem"
+# -------------- PDF plot builder --------------
 
-    tri = _read_triangulation(tri_csv)
-    truth = _read_oem_ccsds(oem_path)
-
+def build_and_append_figures(tri: pd.DataFrame, truth: pd.DataFrame, target_id: str, pdf: PdfPages):
     # Optional error columns
     has_err = all(c in tri.columns for c in ("err_x_km","err_y_km","err_z_km"))
-
     # Derived metrics
     tri = _compute_derived(tri)
 
@@ -186,19 +186,16 @@ def main():
 
     fig = plt.figure(figsize=(11, 8))
     ax: Axes = fig.add_subplot(111, projection='3d')
-
     ax.plot(truth["x_km"], truth["y_km"], truth["z_km"], lw=1.0, label=f"{target_id} truth (OEM)")
     sc = ax.scatter(xhat[:,0], xhat[:,1], xhat[:,2], s=16, marker='x', c=tri["CEP50_ENU_km"], cmap=cm.viridis, depthshade=False, label="x̂ (colored by CEP50_ENU)")
     cbar = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.05)
     cbar.set_label("CEP50_ENU [km]")
-
     # sparse ellipsoids
     step = max(1, len(tri)//12)
     for _, row in tri.iloc[::step].iterrows():
         mu = np.array([row["xhat_x_km"], row["xhat_y_km"], row["xhat_z_km"]], dtype=float)
         S  = _cov_from_row(row)
         _draw_cov_ellipsoid(ax, mu, S, scale=ELLIPSOID_SCALE_SIG, n=ELLIPSOID_SAMPLES)
-
     # axes
     ax.set_xlabel("x [km]")
     ax.set_ylabel("y [km]")
@@ -214,22 +211,19 @@ def main():
     ax.set_xlim(centers[0]-R, centers[0]+R)
     ax.set_ylim(centers[1]-R, centers[1]+R)
     ax.set_zlim(centers[2]-R, centers[2]+R)
-
-    out1 = PLOT_DIR / f"suite_3d_{target_id}.png"
-    plt.tight_layout(); fig.savefig(out1, dpi=160)
-    print(f"[PLOT] {out1}")
+    plt.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
 
     # ------------- Figure 2: Time series panel -------------
     t = tri["time"]
     nrows = 5 if has_err else 3
     fig2, axes = plt.subplots(nrows, 1, figsize=(11, 2.2*nrows), sharex=True)
-
     k = 0
     axes[k].plot(t, tri["Nsats"], marker='.', lw=0.8)
     axes[k].set_ylabel("Nsats")
     axes[k].grid(True, linestyle=":", alpha=0.5)
     k += 1
-
     if all(c in tri.columns for c in ("beta_mean_deg","beta_min_deg","beta_max_deg")):
         axes[k].plot(t, tri["beta_mean_deg"], lw=1.0, label="β_mean")
         axes[k].plot(t, tri["beta_min_deg"], lw=0.8, label="β_min")
@@ -238,12 +232,10 @@ def main():
         axes[k].legend(loc="upper right")
         axes[k].grid(True, linestyle=":", alpha=0.5)
         k += 1
-
     axes[k].plot(t, tri["CEP50_ENU_km"], lw=1.0)
     axes[k].set_ylabel("CEP50_ENU [km]")
     axes[k].grid(True, linestyle=":", alpha=0.5)
     k += 1
-
     if has_err:
         mx, my, mz = tri["err_x_km"].mean(), tri["err_y_km"].mean(), tri["err_z_km"].mean()
         ex = (tri["err_x_km"] - mx).abs(); ey = (tri["err_y_km"] - my).abs(); ez = (tri["err_z_km"] - mz).abs()
@@ -254,22 +246,18 @@ def main():
         axes[k].legend(loc="upper right")
         axes[k].grid(True, linestyle=":", alpha=0.5)
         k += 1
-
         axes[k].plot(t, tri.get("err_norm_km", (ex**2+ey**2+ez**2)**0.5), lw=1.0)
         axes[k].set_ylabel("‖err‖ [km]")
         axes[k].grid(True, linestyle=":", alpha=0.5)
         k += 1
-
     axes[k-1].set_xlabel("time [UTC]")
     fig2.autofmt_xdate()
-
-    out2 = PLOT_DIR / f"suite_timeseries_{target_id}.png"
-    plt.tight_layout(); fig2.savefig(out2, dpi=160)
-    print(f"[PLOT] {out2}")
+    plt.tight_layout()
+    pdf.savefig(fig2)
+    plt.close(fig2)
 
     # ------------- Figure 3: Correlations -------------
     fig3, axes3 = plt.subplots(1, 3 if has_err else 2, figsize=(13, 4))
-
     # CEP vs beta_mean
     if "beta_mean_deg" in tri.columns:
         axes3[0].scatter(tri["beta_mean_deg"], tri["CEP50_ENU_km"], s=12, alpha=0.7)
@@ -278,7 +266,6 @@ def main():
         axes3[0].grid(True, linestyle=":", alpha=0.5)
     else:
         axes3[0].axis('off')
-
     # |err| vs beta_mean
     if has_err and "beta_mean_deg" in tri.columns:
         axes3[1].scatter(tri["beta_mean_deg"], (tri["err_x_km"]-tri["err_x_km"].mean()).abs(), s=10, alpha=0.6, label='|err_x|')
@@ -290,17 +277,15 @@ def main():
         axes3[1].grid(True, linestyle=":", alpha=0.5)
     else:
         axes3[1].axis('off')
-
     # |err_y| vs Nsats
     if has_err:
         axes3[2 if has_err else 1].scatter(tri["Nsats"], (tri["err_y_km"]-tri["err_y_km"].mean()).abs(), s=12, alpha=0.7)
         axes3[2 if has_err else 1].set_xlabel("Nsats")
         axes3[2 if has_err else 1].set_ylabel("|err_y| (bias-out) [km]")
         axes3[2 if has_err else 1].grid(True, linestyle=":", alpha=0.5)
-
-    out3 = PLOT_DIR / f"suite_correlations_{target_id}.png"
-    plt.tight_layout(); fig3.savefig(out3, dpi=160)
-    print(f"[PLOT] {out3}")
+    plt.tight_layout()
+    pdf.savefig(fig3)
+    plt.close(fig3)
 
     # ------------- Figure 4: Histograms (bias-removed) -------------
     if has_err:
@@ -316,11 +301,53 @@ def main():
             a.grid(True, linestyle=":", alpha=0.4)
             a.set_xlabel("km")
         ax4[0].set_ylabel("count")
-        out4 = PLOT_DIR / f"suite_hist_{target_id}.png"
-        plt.tight_layout(); fig4.savefig(out4, dpi=160)
-        print(f"[PLOT] {out4}")
+        plt.tight_layout()
+        pdf.savefig(fig4)
+        plt.close(fig4)
 
-    print("[OK] Plot suite complete.")
+
+# ---------------- main loop for PDFs ----------------
+
+def main():
+    # Determine which CSVs to process
+    if TRI_CSV_PATH is not None:
+        csvs = [Path(TRI_CSV_PATH)]
+    else:
+        csvs = _find_triangulation_csvs(TRI_DIR)
+
+    for tri_csv in csvs:
+        m = re.search(r"(HGV_\d+)", tri_csv.name)
+        if not m:
+            print(f"[SKIP] Could not infer target id from {tri_csv.name}")
+            continue
+        target_id = m.group(1)
+        oem_path = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM" / f"{target_id}.oem"
+        try:
+            tri = _read_triangulation(tri_csv)
+            truth = _read_oem_ccsds(oem_path)
+        except Exception as e:
+            print(f"[SKIP] {target_id}: {e}")
+            continue
+
+        pdf_path = RUN_DIR / f"{target_id}.pdf"
+        with PdfPages(pdf_path) as pdf:
+            build_and_append_figures(tri, truth, target_id, pdf)
+        print(f"[PDF ] Wrote {pdf_path}")
+
+    # Write a simple manifest of processed targets
+    try:
+        manifest = RUN_DIR / "manifest.txt"
+        with manifest.open("w") as mf:
+            mf.write(f"plot_run_id={RUN_ID}\n")
+            mf.write(f"generated_utc={datetime.utcnow().isoformat()}Z\n")
+            mf.write("files=\n")
+            for p in sorted(RUN_DIR.glob("*.pdf")):
+                mf.write(f"  - {p.name}\n")
+        print(f"[MAN ] Wrote {manifest}")
+    except Exception as e:
+        print(f"[WARN] Could not write manifest: {e}")
+
+    print("[OK] Plot suite PDF generation complete.")
 
 
 if __name__ == "__main__":
