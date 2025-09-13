@@ -56,8 +56,8 @@ def _log(level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
 # Override YAML at runtime without editing the config.
 # Set to True/False to force, or None to use YAML defaults.
 FLAGS = {
-    "RUN_TRIANGULATION": False,  # if False -> reuse existing triangulation
-    "RUN_GEOM_PLOTS": False,
+    "RUN_TRIANGULATION": True,  # if False -> reuse existing triangulation
+    "RUN_GEOM_PLOTS": True,
     "RUN_FILTER_FORWARD": None,
     "RUN_FILTER_PLOTS": None,
     "RUN_INTERACTIVE_3D": None,
