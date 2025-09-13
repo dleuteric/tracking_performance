@@ -15,24 +15,41 @@ from matplotlib.axes import Axes
 from matplotlib import cm
 from matplotlib.colors import Normalize
 
+# --- config import ---
+from config.loader import load_config
+
 import os
 import uuid
 from datetime import datetime
 
 from matplotlib.backends.backend_pdf import PdfPages
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TRI_DIR      = PROJECT_ROOT / "exports" / "triangulation"
-TRI_CSV_PATH = TRI_DIR / '20250912T224050Z_48sat_550km_53deg_b41d192b/xhat_geo_HGV_00001.csv'  # if None, loop all xhat_geo_*.csv in TRI_DIR
-PLOT_DIR     = PROJECT_ROOT / "plots"
-PLOT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Run stamping: create a unique folder per plotting run
-RUN_ID = os.environ.get("RUN_ID") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8]
-RUN_DIR = PLOT_DIR / RUN_ID
+# ---------------- config-driven paths ----------------
+CFG = load_config()
+PROJECT_ROOT = Path(CFG["project"]["root"]).resolve()
+TRI_DIR      = (PROJECT_ROOT / CFG["paths"]["triangulation_out"]).resolve()
+PLOT_DIR     = (PROJECT_ROOT / CFG["paths"]["geom_plots_out"]).resolve()
+OEM_DIR      = (PROJECT_ROOT / CFG["paths"]["oem_root"]).resolve()
+RUN_ID       = CFG["project"]["run_id"]
+RUN_DIR      = (PLOT_DIR / RUN_ID)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
-print(f"[RUN ] Plot run id: {RUN_ID}")
-print(f"[OUT ] Plot directory: {RUN_DIR}")
+
+# logging level (INFO default)
+LOG_LEVEL = str(CFG.get("logging", {}).get("level", "INFO")).upper()
+_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+def _log(level: str, msg: str):
+    if _LEVELS.get(level, 20) >= _LEVELS.get(LOG_LEVEL, 20):
+        print(msg)
+
+_log("INFO", f"[RUN ] Plot run id: {RUN_ID}")
+_log("INFO", f"[OUT ] Plot directory: {RUN_DIR}")
+
+# Optional DPI from YAML
+try:
+    plt.rcParams['figure.dpi'] = int(CFG.get('plotting', {}).get('dpi', 160))
+except Exception:
+    pass
 
 # knobs
 DOTS_PER_EPOCH      = 60
@@ -44,9 +61,10 @@ RNG_SEED            = 7
 # ---------------- helpers ----------------
 
 def _find_triangulation_csvs(tri_dir: Path) -> list[Path]:
-    cands = sorted(tri_dir.glob("xhat_geo_*.csv"))
+    run_dir = (tri_dir / RUN_ID)
+    cands = sorted(run_dir.glob("xhat_geo_*.csv"))
     if not cands:
-        raise FileNotFoundError(f"No triangulation CSVs in {tri_dir}")
+        raise FileNotFoundError(f"No triangulation CSVs in {run_dir}")
     return cands
 
 
@@ -485,30 +503,27 @@ def build_and_append_figures(tri: pd.DataFrame, truth: pd.DataFrame, target_id: 
 # ---------------- main loop for PDFs ----------------
 
 def main():
-    # Determine which CSVs to process
-    if TRI_CSV_PATH is not None:
-        csvs = [Path(TRI_CSV_PATH)]
-    else:
-        csvs = _find_triangulation_csvs(TRI_DIR)
+    # Discover CSVs for this RUN_ID
+    csvs = _find_triangulation_csvs(TRI_DIR)
 
     for tri_csv in csvs:
         m = re.search(r"(HGV_\d+)", tri_csv.name)
         if not m:
-            print(f"[SKIP] Could not infer target id from {tri_csv.name}")
+            _log("WARN", f"[SKIP] Could not infer target id from {tri_csv.name}")
             continue
         target_id = m.group(1)
-        oem_path = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM" / f"{target_id}.oem"
+        oem_path = OEM_DIR / f"{target_id}.oem"
         try:
             tri = _read_triangulation(tri_csv)
             truth = _read_oem_ccsds(oem_path)
         except Exception as e:
-            print(f"[SKIP] {target_id}: {e}")
+            _log("WARN", f"[SKIP] {target_id}: {e}")
             continue
 
         pdf_path = RUN_DIR / f"{target_id}.pdf"
         with PdfPages(pdf_path) as pdf:
             build_and_append_figures(tri, truth, target_id, pdf)
-        print(f"[PDF ] Wrote {pdf_path}")
+        _log("INFO", f"[PDF ] Wrote {pdf_path}")
 
     # Write a simple manifest of processed targets
     try:
@@ -519,11 +534,11 @@ def main():
             mf.write("files=\n")
             for p in sorted(RUN_DIR.glob("*.pdf")):
                 mf.write(f"  - {p.name}\n")
-        print(f"[MAN ] Wrote {manifest}")
+        _log("INFO", f"[MAN ] Wrote {manifest}")
     except Exception as e:
-        print(f"[WARN] Could not write manifest: {e}")
+        _log("WARN", f"[WARN] Could not write manifest: {e}")
 
-    print("[OK] Plot suite PDF generation complete.")
+    _log("INFO", "[OK ] Plot suite PDF generation complete.")
 
 
 if __name__ == "__main__":
