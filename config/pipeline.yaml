@@ -1,0 +1,89 @@
+# =========================
+# ez-SMAD: pipeline config
+# Commentabile, leggibile. Un solo posto per tutto.
+# =========================
+
+project:
+  # root: lasciamo auto-detect (cartella repo). Puoi forzarlo via ENV PROJECT_ROOT.
+  root: auto
+  # run_id: imposta per riusare un run; se null, la triangolazione ne creerà uno.
+  run_id: null
+  timezone: UTC
+
+paths:
+  # Radici I/O
+  exports_root: exports
+  stk_exports: exports/stk_exports
+  los_root: "{stk_exports}/OUTPUT_LOS_VECTORS"    # per target: {los_root}/{TARGET_ID}
+  ephem_root: "{stk_exports}/OUTPUT_EPHEM"        # ephemerides OBS_xxx*.csv
+  oem_root: exports/target_exports/OUTPUT_OEM     # HGV_xxxxx.oem
+  triangulation_out: exports/triangulation        # xhat_geo_*.csv
+  tracks_out: exports/tracks                      # *_track_icrf_forward.csv (e smoothed più avanti)
+  geom_plots_out: plots                           # suite_*_HGV_*.png/pdf
+  filter_plots_out: plots_filter                  # *_tracking.pdf, *_3d.html
+  cache_dir: .cache
+
+run_id:
+  # Naming del RUN_ID inferito dalla costellazione
+  template: "{date}Z_{nsats}sats_{alt_km}km_{inc_deg}deg_{hash}"
+  date_format: "%Y%m%dT%H%M%S"
+  # Tiriamo fuori nsats/alt/inc dagli header delle ephem OBS_* se possibile
+  fields_from_ephem_headers: true
+  # Fallback se gli header non bastano
+  fallback:
+    nsats: 0
+    alt_km: 0
+    inc_deg: 0
+
+geometry:
+  frame: ICRF                # coerente con i nostri export
+  # Terra per occlusione geometrica
+  earth_radius_km: 6378.137
+  occlusion_margin_km: 0.0   # >0 per essere conservativi
+  # Gate di visibilità “minimo sindacale” per triangolare
+  min_observers: 2
+  # Baseline angles
+  beta_pairs_mode: "all"     # "all" oppure "kbest"
+  beta_summary_k: 3          # se "kbest", quante coppie al top valutare
+  # Sincronizzazione temporale
+  resample_hz: 1             # Hz a cui forziamo la griglia temporale
+  interp_method: "linear"
+  max_time_gap_s: 5          # oltre questo, non interpolare (salta l’epoch)
+
+gpm_measurement:
+  # Rumore angolare di riferimento per Monte Carlo / Sigma_geo (se usato)
+  los_noise_rad: 0.001       # 1 mrad
+  # CEP analitico/geometrico; lasciamo "analytic" come default
+  cep_method: "analytic"
+  write_pair_metrics: true   # esporta β_min/max/mean, coppie, GDOP se calcolato
+
+filter:
+  P0_diag: [25.0, 25.0, 25.0,   0.25, 0.25, 0.25,   0.01, 0.01, 0.01]
+  jerk_psd_km2_s5: 3.0e-6      # ↑ un filo per dare manovrabilità
+  chi2_gate_3dof: 1.0e9        # disattiva di fatto il gate per test
+  inflate:
+    bad_geom_factor: 1.0
+    condA_thresh: 1.0e99
+    condA_factor: 1.0
+    betamin_thresh_deg: 0.0
+    betamin_factor: 1.0
+
+plotting:
+  dpi: 160
+  # PDF “paper-grade” + HTML interattivi
+  make_interactive_html: true
+  # Opzioni estetiche generiche
+  style: "default"
+
+orchestrator:
+  # Se true, esegue tutte le fasi in sequenza
+  run_triangulation: true
+  run_geom_plots: true
+  run_filter_forward: true
+  run_filter_plots: true
+  run_interactive_3d: true
+  # Limita epochs per smoke test (null = disabilitato)
+  max_epochs: null
+
+logging:
+  level: "INFO"   # DEBUG/INFO/WARN/ERROR
