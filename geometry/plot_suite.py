@@ -24,6 +24,9 @@ from datetime import datetime
 
 from matplotlib.backends.backend_pdf import PdfPages
 
+# --- extra import for JSON parsing ---
+import json
+
 # ---------------- config-driven paths ----------------
 CFG = load_config()
 PROJECT_ROOT = Path(CFG["project"]["root"]).resolve()
@@ -190,6 +193,60 @@ def _compute_derived(tri: pd.DataFrame) -> pd.DataFrame:
     return tri
 
 
+# ------------------- helpers for β–proxyGDOP plots -------------------
+
+def _scale_marker_sizes(nsats: np.ndarray, smin: int = 8, smax: int = 36) -> np.ndarray:
+    ns = np.asarray(nsats, float)
+    if ns.size == 0:
+        return np.array([])
+    lo, hi = np.nanmin(ns), np.nanmax(ns)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.full_like(ns, (smin + smax) * 0.5)
+    return smin + (smax - smin) * (ns - lo) / (hi - lo)
+
+
+def _parse_pairs_topk_cell(cell) -> list[tuple[float, float]]:
+    """From JSON cell like [{'A':'001','B':'002','beta_deg':..., 'stereo_gdop':...}, ...] -> list[(beta, gdop)]."""
+    if pd.isna(cell):
+        return []
+    try:
+        arr = json.loads(cell)
+        out = []
+        for d in arr:
+            b = float(d.get('beta_deg', np.nan))
+            g = float(d.get('stereo_gdop', np.nan))
+            if np.isfinite(b) and np.isfinite(g):
+                out.append((b, g))
+        return out
+    except Exception:
+        return []
+
+
+def _collect_pairs_topk(tri: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    betas, gdops = [], []
+    if 'pairs_topK' not in tri.columns:
+        return np.array([]), np.array([])
+    for _, row in tri.iterrows():
+        pg = _parse_pairs_topk_cell(row['pairs_topK'])
+        if pg:
+            b, g = zip(*pg)
+            betas.extend(b); gdops.extend(g)
+    return np.asarray(betas, float), np.asarray(gdops, float)
+
+
+def _load_pairs_heatmap_sidecar(target_id: str) -> tuple[np.ndarray, np.ndarray]:
+    side = (TRI_DIR / RUN_ID / f"pairs_heatmap_{target_id}.npy")
+    if not side.exists():
+        return np.array([]), np.array([])
+    try:
+        arr = np.load(side)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            return np.asarray(arr[:,0], float), np.asarray(arr[:,1], float)
+    except Exception:
+        pass
+    return np.array([]), np.array([])
+
+
 def _binned_stats(x: np.ndarray, y: np.ndarray, bins: np.ndarray):
     idx = np.digitize(x, bins) - 1
     out = []
@@ -334,9 +391,20 @@ def build_and_append_figures(tri: pd.DataFrame, truth: pd.DataFrame, target_id: 
     fig = plt.figure(figsize=(11, 8))
     ax: Axes = fig.add_subplot(111, projection='3d')
     ax.plot(truth["x_km"], truth["y_km"], truth["z_km"], lw=1.0, label=f"{target_id} truth (OEM)")
-    sc = ax.scatter(xhat[:,0], xhat[:,1], xhat[:,2], s=16, marker='x', c=tri["CEP50_ENU_km"], cmap=cm.viridis, depthshade=False, label="x̂ (colored by CEP50_ENU)")
+    sizes = _scale_marker_sizes(tri["Nsats"].to_numpy())
+    sc = ax.scatter(xhat[:,0], xhat[:,1], xhat[:,2], s=sizes, marker='o', c=tri["CEP50_ENU_km"], cmap=cm.viridis, depthshade=False, label="x̂ (CEP color, size∝Nsats)")
     cbar = plt.colorbar(sc, ax=ax, shrink=0.6, pad=0.05)
     cbar.set_label("CEP50_ENU [km]")
+    # marker-size legend for Nsats (min/median/max)
+    try:
+        ns = tri["Nsats"].to_numpy()
+        vmin, vmed, vmax = int(np.nanmin(ns)), int(np.nanmedian(ns)), int(np.nanmax(ns))
+        smin, smed, smax = _scale_marker_sizes(np.array([vmin, vmed, vmax]))
+        for s, v, lab in [(smin, vmin, f"Nsats={vmin}"), (smed, vmed, f"Nsats={vmed}"), (smax, vmax, f"Nsats={vmax}")]:
+            ax.scatter([], [], [], s=s, c='gray', alpha=0.6, label=lab)
+        ax.legend(loc="upper right")
+    except Exception:
+        pass
     # sparse ellipsoids
     step = max(1, len(tri)//12)
     for _, row in tri.iloc[::step].iterrows():
@@ -347,7 +415,6 @@ def build_and_append_figures(tri: pd.DataFrame, truth: pd.DataFrame, target_id: 
     ax.set_xlabel("x [km]")
     ax.set_ylabel("y [km]")
     ax.set_zlabel("z [km]")
-    ax.legend(loc="upper right")
     ax.set_title("3D: Truth + x̂ colored by CEP50_ENU")
     # equal-ish bounds
     xs, ys, zs = truth["x_km"].to_numpy(), truth["y_km"].to_numpy(), truth["z_km"].to_numpy()
@@ -379,9 +446,19 @@ def build_and_append_figures(tri: pd.DataFrame, truth: pd.DataFrame, target_id: 
         axes[k].legend(loc="upper right")
         axes[k].grid(True, linestyle=":", alpha=0.5)
         k += 1
-    axes[k].plot(t, tri["CEP50_ENU_km"], lw=1.0)
-    axes[k].set_ylabel("CEP50_ENU [km]")
+    # CEP vs time with Nsats overlay on twin y-axis
+    axes[k].plot(t, tri["CEP50_ENU_km"], lw=1.2, label="CEP50")
+    axes2 = axes[k].twinx()
+    axes2.plot(t, tri["Nsats"], lw=0.8, color='tab:gray', alpha=0.6, label="Nsats")
+    axes[k].set_ylabel("CEP50_ENU [km]"); axes2.set_ylabel("Nsats")
     axes[k].grid(True, linestyle=":", alpha=0.5)
+    # optional combined legend
+    try:
+        h1, l1 = axes[k].get_legend_handles_labels()
+        h2, l2 = axes2.get_legend_handles_labels()
+        axes[k].legend(h1+h2, l1+l2, loc='upper right')
+    except Exception:
+        pass
     k += 1
     if has_err:
         mx, my, mz = tri["err_x_km"].mean(), tri["err_y_km"].mean(), tri["err_z_km"].mean()
@@ -543,3 +620,32 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # ------------- Figure 7: β–proxyGDOP (top-K scatter) + heatmap (all pairs) -------------
+    fig7, (ax7a, ax7b) = plt.subplots(1, 2, figsize=(12, 4))
+    # Scatter for top-K pairs
+    b_topk, g_topk = _collect_pairs_topk(tri)
+    if b_topk.size:
+        ax7a.scatter(b_topk, g_topk, s=8, alpha=0.5)
+        # binned mean line
+        stats = _binned_stats(b_topk, g_topk, np.linspace(0, 180, 61))
+        ax7a.plot(stats[:,0], stats[:,1], 'k-', lw=1.0, label='mean per bin')
+        ax7a.set_title("Top-K pairs: β vs proxy-GDOP (1/|sinβ|)")
+        ax7a.set_xlabel("β [deg]"); ax7a.set_ylabel("proxy-GDOP [–]")
+        ax7a.grid(True, linestyle=":", alpha=0.5); ax7a.legend(loc='upper right')
+    else:
+        ax7a.axis('off')
+
+    # Heatmap for all pairs (sidecar)
+    b_all, g_all = _load_pairs_heatmap_sidecar(target_id)
+    if b_all.size:
+        H, xedges, yedges = np.histogram2d(b_all, g_all, bins=(np.linspace(0,180,73), np.linspace(0,6,61)))
+        im = ax7b.imshow(H.T, origin='lower', aspect='auto',
+                         extent=(xedges[0], xedges[-1], yedges[0], yedges[-1]),
+                         cmap='magma')
+        ax7b.set_title("All pairs: β–proxy-GDOP density")
+        ax7b.set_xlabel("β [deg]"); ax7b.set_ylabel("proxy-GDOP [–]")
+        plt.colorbar(im, ax=ax7b, fraction=0.046, pad=0.04, label='count')
+    else:
+        ax7b.axis('off')
+    plt.tight_layout(); pdf.savefig(fig7); plt.close(fig7)
