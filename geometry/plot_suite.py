@@ -13,6 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib import cm
+from matplotlib.colors import Normalize
 
 import os
 import uuid
@@ -22,7 +23,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRI_DIR      = PROJECT_ROOT / "exports" / "triangulation"
-TRI_CSV_PATH = None  # if None, loop all xhat_geo_*.csv in TRI_DIR
+TRI_CSV_PATH = TRI_DIR / '20250912T224050Z_48sat_550km_53deg_b41d192b/xhat_geo_HGV_00001.csv'  # if None, loop all xhat_geo_*.csv in TRI_DIR
 PLOT_DIR     = PROJECT_ROOT / "plots"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -171,6 +172,134 @@ def _compute_derived(tri: pd.DataFrame) -> pd.DataFrame:
     return tri
 
 
+def _binned_stats(x: np.ndarray, y: np.ndarray, bins: np.ndarray):
+    idx = np.digitize(x, bins) - 1
+    out = []
+    for b in range(len(bins)-1):
+        m = idx == b
+        if not np.any(m):
+            out.append((np.nan, np.nan, np.nan, 0))
+            continue
+        xb = 0.5*(bins[b]+bins[b+1])
+        yb = np.nanmean(y[m])
+        ys = np.nanstd(y[m])
+        out.append((xb, yb, ys, int(m.sum())))
+    arr = np.array(out, dtype=float)
+    return arr  # columns: x_bin_center, y_mean, y_std, count
+
+
+def _scatter_binned(ax: Axes, x, y, nsats=None, bin_deg=0.5, show_points=False, title=None):
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    bins = np.arange(np.nanmin(x)-1e-6, np.nanmax(x)+bin_deg+1e-6, bin_deg)
+    stats = _binned_stats(x, y, bins)
+    # optional background cloud
+    if show_points:
+        c = nsats if nsats is not None else 'k'
+        ax.scatter(x, y, s=6, alpha=0.3, c=c, cmap='viridis')
+    # mean±std as errorbar
+    ax.errorbar(stats[:,0], stats[:,1], yerr=stats[:,2], fmt='o-', lw=1.0, ms=3)
+    ax.grid(True, linestyle=":", alpha=0.5)
+    if title: ax.set_title(title)
+
+
+def _parse_beta_pairs(row) -> tuple[list[str], dict[tuple[str,str], float]]:
+    """Parse 'beta_pairs_deg' like '001-004:95.2|003-004:88.1|...'
+    Returns (ids, {(i,j): angle_deg}).
+    """
+    txt = str(row.get('beta_pairs_deg', ''))
+    parts = [p for p in txt.split('|') if p]
+    pairs = {}
+    ids = set()
+    for p in parts:
+        try:
+            left, ang = p.split(':')
+            a,b = left.split('-')
+            a=a.strip(); b=b.strip(); ang=float(ang)
+            key = (a,b) if a<b else (b,a)
+            pairs[key] = ang
+            ids.add(a); ids.add(b)
+        except Exception:
+            continue
+    ids = sorted(ids)
+    return ids, pairs
+
+
+def _beta_matrix(ids: list[str], pairs: dict[tuple[str,str], float]) -> np.ndarray:
+    n = len(ids)
+    M = np.full((n,n), np.nan, float)
+    for i in range(n):
+        M[i,i] = 0.0
+    idx = {s:i for i,s in enumerate(ids)}
+    for (a,b), ang in pairs.items():
+        if a in idx and b in idx:
+            i,j = idx[a], idx[b]
+            M[i,j] = M[j,i] = ang
+    return M
+
+
+def _plot_beta_matrix(ax: Axes, row, title="β matrix (deg)"):
+    ids, pairs = _parse_beta_pairs(row)
+    if len(ids) < 2:
+        ax.axis('off'); return
+    M = _beta_matrix(ids, pairs)
+    im = ax.imshow(M, cmap='viridis', vmin=0, vmax=180)
+    ax.set_title(title)
+    ax.set_xticks(range(len(ids))); ax.set_yticks(range(len(ids)))
+    ax.set_xticklabels(ids, rotation=90, fontsize=6)
+    ax.set_yticklabels(ids, fontsize=6)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+
+def _score_subset_beta(ids_subset: list[str], pairs: dict[tuple[str,str], float]) -> float:
+    # Proxy score: favor angles vicini a 90°, penalizza troppo stretti o opposti
+    # score = min(g) + mean(g), g = 1 - |beta-90|/90 clipped to [0,1]
+    if len(ids_subset) < 2: return -1e9
+    vals = []
+    for i in range(len(ids_subset)):
+        for j in range(i+1, len(ids_subset)):
+            a,b = ids_subset[i], ids_subset[j]
+            key = (a,b) if a<b else (b,a)
+            ang = pairs.get(key, np.nan)
+            if np.isnan(ang):
+                continue
+            g = 1.0 - min(abs(ang-90.0)/90.0, 1.0)
+            vals.append(g)
+    if not vals: return -1e9
+    vals = np.array(vals)
+    return float(np.nanmin(vals) + np.nanmean(vals))
+
+
+def _greedy_best_subset(ids: list[str], pairs: dict[tuple[str,str], float], m: int) -> list[str]:
+    # Start from best pair (closest to 90), then add the element that maximizes score increase
+    if len(ids) <= m: return ids
+    # best pair
+    best_pair = None; best_pair_score = -1e9
+    for i in range(len(ids)):
+        for j in range(i+1, len(ids)):
+            key = (ids[i], ids[j]) if ids[i]<ids[j] else (ids[j], ids[i])
+            ang = pairs.get(key, np.nan)
+            if np.isnan(ang):
+                continue
+            g = 1.0 - min(abs(ang-90.0)/90.0, 1.0)
+            if g > best_pair_score:
+                best_pair_score = g; best_pair = [ids[i], ids[j]]
+    if not best_pair:
+        return ids[:m]
+    S = best_pair.copy()
+    while len(S) < m:
+        best_add = None; best_score = -1e9
+        rem = [u for u in ids if u not in S]
+        for u in rem:
+            cand = S + [u]
+            sc = _score_subset_beta(cand, pairs)
+            if sc > best_score:
+                best_score = sc; best_add = u
+        if best_add is None:
+            break
+        S.append(best_add)
+    return S
+
+
 
 # -------------- PDF plot builder --------------
 
@@ -304,6 +433,53 @@ def build_and_append_figures(tri: pd.DataFrame, truth: pd.DataFrame, target_id: 
         plt.tight_layout()
         pdf.savefig(fig4)
         plt.close(fig4)
+
+    # ------------- Figure 5: Geometry Insights (binned + subset) -------------
+    fig5, ax5 = plt.subplots(1, 2, figsize=(11, 4))
+    if "beta_mean_deg" in tri.columns:
+        _scatter_binned(ax5[0], tri["beta_mean_deg"], tri["CEP50_ENU_km"], nsats=tri["Nsats"], bin_deg=0.5, show_points=False, title="CEP50_ENU vs β_mean (binned)")
+        ax5[0].set_xlabel("β_mean [deg]"); ax5[0].set_ylabel("CEP50_ENU [km]")
+    else:
+        ax5[0].axis('off')
+
+    # Best-subset proxy time series (m=3..5)
+    has_pairs = 'beta_pairs_deg' in tri.columns and tri['beta_pairs_deg'].notna().any()
+    if has_pairs:
+        ms = [3,4,5]
+        t = tri['time']
+        for msz in ms:
+            scores = []
+            for _, row in tri.iterrows():
+                ids, pairs = _parse_beta_pairs(row)
+                if len(ids) < msz:
+                    scores.append(np.nan); continue
+                Sbest = _greedy_best_subset(ids, pairs, msz)
+                sc = _score_subset_beta(Sbest, pairs)
+                scores.append(sc)
+            ax5[1].plot(t, scores, lw=1.0, label=f"greedy β-proxy, m={msz}")
+        ax5[1].set_title("Best-subset proxy score vs time")
+        ax5[1].set_ylabel("score (↑ better)"); ax5[1].grid(True, linestyle=":", alpha=0.5)
+        ax5[1].legend(loc='upper right')
+    else:
+        ax5[1].axis('off')
+    plt.tight_layout()
+    pdf.savefig(fig5); plt.close(fig5)
+
+    # ------------- Figure 6: β-matrix heatmaps for 3 representative epochs -------------
+    if has_pairs:
+        # pick three epochs: min CEP, median CEP, max CEP
+        cep = tri["CEP50_ENU_km"].to_numpy()
+        good = np.isfinite(cep)
+        if np.any(good):
+            idxs = np.where(good)[0]
+            i_min = idxs[np.argmin(cep[good])]
+            i_med = idxs[len(idxs)//2]
+            i_max = idxs[np.argmax(cep[good])]
+            picks = [(i_min, 'min CEP'), (i_med, 'median CEP'), (i_max, 'max CEP')]
+            fig6, ax6 = plt.subplots(1, 3, figsize=(12, 3.6))
+            for k,(ix,lab) in enumerate(picks):
+                _plot_beta_matrix(ax6[k], tri.iloc[ix], title=f"β matrix — {lab}")
+            plt.tight_layout(); pdf.savefig(fig6); plt.close(fig6)
 
 
 # ---------------- main loop for PDFs ----------------
