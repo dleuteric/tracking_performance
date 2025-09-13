@@ -18,146 +18,58 @@ from datetime import datetime
 from itertools import combinations
 from typing import List, Dict, Tuple
 
+# Config loader import
+from config.loader import load_config
+
 # --------------------------
-# Config
+# Config (from YAML)
 # --------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# Base directories
-LOS_BASE_DIR = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_LOS_VECTORS"
-EPH_DIR      = PROJECT_ROOT / "exports" / "stk_exports" / "OUTPUT_EPHEM"
-OEM_DIR      = PROJECT_ROOT / "exports" / "target_exports" / "OUTPUT_OEM"
-OUT_DIR      = PROJECT_ROOT / "exports" / "triangulation"
+CFG = load_config()
+PROJECT_ROOT = Path(CFG["project"]["root"]).resolve()
 
+# Paths
+LOS_BASE_DIR = (PROJECT_ROOT / CFG["paths"]["los_root"]).resolve()
+EPH_DIR      = (PROJECT_ROOT / CFG["paths"]["ephem_root"]).resolve()
+OEM_DIR      = (PROJECT_ROOT / CFG["paths"]["oem_root"]).resolve()
+OUT_DIR      = (PROJECT_ROOT / CFG["paths"]["triangulation_out"]).resolve()
 
-# ---- Constellation param inference ----
-def _infer_constellation_params_from_ephem(eph_dir: Path, r_earth_km: float) -> tuple[int, float, float]:
-    """Infer (Nsats, mean altitude [km], mean inclination [deg]) from available OBS ephemerides.
-    - Nsats: number of ephemeris files matching OBS_***_ephem.csv that are readable
-    - Altitude: median of |r|-R_earth over first ~10 epochs per sat, averaged across sats
-    - Inclination: arccos(h_z/|h|) from r×v at first usable epoch per sat, averaged across sats
-    Fallback: raise on total failure; caller can catch and use env/defaults.
-    """
-    eph_files = sorted(eph_dir.glob("OBS_*_ephem.csv"))
-    if not eph_files:
-        raise FileNotFoundError(f"No ephemeris files in {eph_dir}")
-
-    inc_list = []
-    alt_list = []
-    good = 0
-    for f in eph_files:
-        try:
-            df = read_stk_csv(f)
-            cols = {c.lower(): c for c in df.columns}
-            # Normalize time & columns
-            needed_pos = [c for c in ["time","x_km","y_km","z_km"] if c in df.columns]
-            if len(needed_pos) < 4:
-                # try raw x,y,z
-                if all(c in df.columns for c in ["time","x","y","z"]):
-                    df = df.rename(columns={"x":"x_km","y":"y_km","z":"z_km"})
-                else:
-                    continue
-            df = df[["time","x_km","y_km","z_km"] + [c for c in ["vx_kmps","vy_kmps","vz_kmps"] if c in df.columns]].copy()
-            df = _norm_time_utc(df, col="time")
-            if len(df) < 2:
-                continue
-            r = df.loc[:, ["x_km","y_km","z_km"]].to_numpy(float)
-            # altitude estimate over first up-to-10 rows
-            k = min(10, len(r))
-            alt = np.median(np.linalg.norm(r[:k], axis=1) - r_earth_km)
-
-            # velocity: prefer provided; else finite difference
-            if all(c in df.columns for c in ["vx_kmps","vy_kmps","vz_kmps"]):
-                v = df.loc[:, ["vx_kmps","vy_kmps","vz_kmps"]].to_numpy(float)
-            else:
-                # central difference for rows 0..2 if possible
-                t = pd.to_datetime(df["time"]).astype("int64")/1e9  # seconds
-                t = t.to_numpy(float)
-                if len(df) >= 3 and (t[2] != t[0]):
-                    v = (r[2] - r[0]) / (t[2]-t[0])
-                    v = np.vstack([v, v])  # shape guard
-                else:
-                    # fallback: forward diff on first two
-                    if t[1] == t[0]:
-                        continue
-                    v = np.vstack([ (r[1]-r[0])/(t[1]-t[0]), (r[1]-r[0])/(t[1]-t[0]) ])
-
-            h = np.cross(r[0], v[0])
-            hn = np.linalg.norm(h)
-            if hn == 0:
-                continue
-            inc = np.degrees(np.arccos(np.clip(h[2]/hn, -1.0, 1.0)))
-
-            inc_list.append(inc)
-            alt_list.append(alt)
-            good += 1
-        except Exception:
-            continue
-
-    if good == 0:
-        raise RuntimeError("Could not infer constellation params from ephemerides")
-
-    nsats = good
-    alt_km = float(np.mean(alt_list))
-    inc_deg = float(np.mean(inc_list))
-    return nsats, alt_km, inc_deg
-
-def _get_run_params() -> tuple[int,float,float]:
-    # Try inference first
-    try:
-        ns, alt, inc = _infer_constellation_params_from_ephem(EPH_DIR, R_EARTH_KM)
-        print(f"[INF ] Inferred constellation: Nsats~{ns}, alt~{alt:.1f} km, inc~{inc:.2f} deg")
-        return ns, alt, inc
-    except Exception as e:
-        print(f"[INF ] Inference failed ({e}); falling back to env/defaults")
-        # Fallback to environment or defaults
-        try:
-            ns = int(os.environ.get("NSATS", "48"))
-        except Exception:
-            ns = 48
-        try:
-            alt = float(os.environ.get("ALT_KM", "550"))
-        except Exception:
-            alt = 550.0
-        try:
-            inc = float(os.environ.get("INC_DEG", "53"))
-        except Exception:
-            inc = 53.0
-        return ns, alt, inc
-
-NSATS, ALT_KM, INC_DEG = _get_run_params()
-_run_uuid = uuid.uuid4().hex[:8]
-_run_time = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-# Round altitude to nearest km and inclination to nearest tenth for stable names
-alt_name = int(round(ALT_KM))
-inc_name = ("%.1f" % INC_DEG).rstrip("0").rstrip(".")
-RUN_ID = os.environ.get("RUN_ID") or f"{_run_time}_{NSATS}sat_{alt_name}km_{inc_name}deg_{_run_uuid}"
-RUN_DIR = OUT_DIR / RUN_ID
+# Run ID (single source of truth from loader)
+RUN_ID  = CFG["project"]["run_id"]
+RUN_DIR = (OUT_DIR / RUN_ID)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
-print(f"[RUN ] Triangulation run id: {RUN_ID}")
-print(f"[OUT ] Triangulation directory: {RUN_DIR}")
+
+# Logging (from YAML)
+LOG_LEVEL = str(CFG.get("logging", {}).get("level", "INFO")).upper()
+_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+def _log(level: str, msg: str):
+    if _LEVELS.get(level, 20) >= _LEVELS.get(LOG_LEVEL, 20):
+        print(msg)
+
+_log("INFO", f"[RUN ] Triangulation run id: {RUN_ID}")
+_log("INFO", f"[OUT ] Triangulation directory: {RUN_DIR}")
+
+# Gating & performance from YAML
+R_EARTH_KM     = float(CFG["geometry"]["earth_radius_km"])  # km
+N_OBSERVERS    = int(CFG["geometry"]["min_observers"])     # >=2
+SIGMA_LOS      = float(CFG["gpm_measurement"]["los_noise_rad"])  # rad
+BETA_PAIRS_MODE= "summary" if CFG.get("geometry",{}).get("beta_pairs_mode","all")=="kbest" else "summary"
+BETA_SUMMARY_K = int(CFG.get("geometry",{}).get("beta_summary_k", 5))
+DO_MONTE_CARLO = True
+MC_SAMPLES     = 50
+MC_EVERY       = 20
+MC_SEED        = 12345
+PROGRESS_EVERY = 100
 
 # Run mode
-LOOP_ALL_TARGETS = True   # if True, run all targets found under LOS_BASE_DIR (and with matching OEM)
-TARGET_ID        = "HGV_00007"  # used when LOOP_ALL_TARGETS=False
+LOOP_ALL_TARGETS = True   # we iterate targets discovered under LOS_BASE_DIR that also have OEM
+TARGET_ID        = "HGV_00007"  # used only if LOOP_ALL_TARGETS=False
 
 # Helper: get paths for a target
 def target_paths(target_id: str) -> tuple[Path, Path]:
-    """Return LOS directory for target and OEM path."""
     los_dir = LOS_BASE_DIR / target_id
     oem_path = OEM_DIR / f"{target_id}.oem"
     return los_dir, oem_path
-
-# Gating & performance
-R_EARTH_KM   = 6378.137
-N_OBSERVERS  = 2          # minimum simultaneous observers
-SIGMA_LOS    = 150e-6       # rad (default 1 mrad)
-DO_MONTE_CARLO = True
-MC_SAMPLES     = 50
-MC_EVERY       = 20       # compute MC every N epochs
-MC_SEED        = 12345
-BETA_PAIRS_MODE= "summary"  # "full" | "summary" | "none"
-BETA_SUMMARY_K = 5
-PROGRESS_EVERY = 100
 
 # --------------------------
 # IO helpers
@@ -397,20 +309,20 @@ def load_eph(obs: str) -> pd.DataFrame:
 
 def run_for_target(target_id: str):
     los_dir, oem_path = target_paths(target_id)
-    print(f"[TGT ] {target_id}")
-    print(f"[PATH] LOS_DIR: {los_dir}")
-    print(f"[PATH] EPH_DIR: {EPH_DIR}")
+    _log("INFO", f"[TGT ] {target_id}")
+    _log("DEBUG", f"[PATH] LOS_DIR: {los_dir}")
+    _log("DEBUG", f"[PATH] EPH_DIR: {EPH_DIR}")
     assert los_dir.is_dir() and EPH_DIR.is_dir()
 
     obs_all = discover_observers(los_dir)
     if not obs_all:
         raise FileNotFoundError(f"No LOS files under {los_dir}")
-    print(f"[DISC] Observers discovered: {obs_all}")
+    _log("DEBUG", f"[DISC] Observers discovered: {obs_all}")
 
     truth = read_oem_ccsds(oem_path)
     truth = _norm_time_utc(truth.reset_index(), col="time").set_index("time")
     master_index = truth.index
-    print(f"[TRUTH] OEM epochs: {len(master_index)} from {oem_path.name}")
+    _log("INFO", f"[TRUTH] OEM epochs: {len(master_index)} from {oem_path.name}")
 
     # Build aligned per-observer tables on the master OEM epochs
     aligned: Dict[str, pd.DataFrame] = {}
@@ -426,7 +338,7 @@ def run_for_target(target_id: str):
         U = interp_los_to_times(los, master_index)
         common = E.index.intersection(U.index)
         if len(common)==0:
-            print(f"[JOIN] OBS {obs}: 0 rows on OEM epochs — skip")
+            _log("DEBUG", f"[JOIN] OBS {obs}: 0 rows on OEM epochs — skip")
             continue
         df = pd.DataFrame({
             "x_km": E.loc[common, "x_km"].astype(float),
@@ -444,18 +356,19 @@ def run_for_target(target_id: str):
         df["vis"] = ~blocked
         vis_count = int(df["vis"].sum())
         if vis_count == 0:
-            print(f"[VIS ] OBS {obs}: 0 visible epochs after occlusion — drop")
+            _log("DEBUG", f"[VIS ] OBS {obs}: 0 visible epochs after occlusion — drop")
             continue
         aligned[obs] = df
-        print(f"[JOIN] OBS {obs}: {len(df)} rows (interpolated) | visible={vis_count}")
+        _log("DEBUG", f"[JOIN] OBS {obs}: {len(df)} rows (interp) | visible={vis_count}")
 
     if not aligned:
         raise RuntimeError("No observers aligned to OEM epochs.")
 
     usable_obs = sorted(aligned.keys())
-    print(f"[USE ] Observers after occlusion gate: {usable_obs}")
-    print(f"[SAVE] Output dir: {OUT_DIR}")
-    print(f"[SAVE] Run-stamped dir: {RUN_DIR}")
+    _log("INFO", f"[USE ] Observers after occlusion gate: {len(usable_obs)} used")
+    _log("DEBUG", f"[USE ] List: {usable_obs}")
+    _log("DEBUG", f"[SAVE] Output dir: {OUT_DIR}")
+    _log("DEBUG", f"[SAVE] Run-stamped dir: {RUN_DIR}")
 
     # Triangulation loop with Earth-occlusion gate using TRUE target
     rng = np.random.default_rng(MC_SEED)
@@ -482,8 +395,8 @@ def run_for_target(target_id: str):
 
         if len(us) < N_OBSERVERS:
             skipped += 1
-            if (k % PROGRESS_EVERY)==0:
-                print(f"[PROG] epoch {k+1}/{len(master_index)} | kept={kept} skipped={skipped}")
+            if LOG_LEVEL == "DEBUG" and (k % PROGRESS_EVERY)==0:
+                _log("DEBUG", f"[PROG] epoch {k+1}/{len(master_index)} | kept={kept} skipped={skipped}")
             continue
 
         x_hat, condA = triangulate_epoch(rs, us)
@@ -541,22 +454,22 @@ def run_for_target(target_id: str):
         })
 
         kept += 1
-        if (k % PROGRESS_EVERY)==0:
+        if LOG_LEVEL == "DEBUG" and (k % PROGRESS_EVERY)==0:
             elapsed = time.time() - t_start
-            print(f"[PROG] epoch {k+1}/{len(master_index)} | kept={kept} skipped={skipped} | Nsats={len(us)} | elapsed={elapsed:.1f}s")
+            _log("DEBUG", f"[PROG] epoch {k+1}/{len(master_index)} | kept={kept} skipped={skipped} | Nsats={len(us)} | elapsed={elapsed:.1f}s")
 
-    print(f"[GATE] N_OBSERVERS>={N_OBSERVERS} | kept {kept} epochs, skipped {skipped}")
+    _log("INFO", f"[GATE] N_OBSERVERS>={N_OBSERVERS} | kept {kept} epochs, skipped {skipped}")
 
     # ensure stamped dir exists
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     out = pd.DataFrame(rows).sort_values("time")
     if out.empty:
-        print("[WARN] No epochs kept after Earth-occlusion gating.")
+        _log("WARN", "[WARN] No epochs kept after Earth-occlusion gating.")
         return
     out["time"] = pd.to_datetime(out["time"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     out_path = RUN_DIR / f"xhat_geo_{target_id}.csv"
     out.to_csv(out_path, index=False)
-    print(f"[OK ] Wrote {len(out)} epochs -> {out_path}")
+    _log("INFO", f"[OK ] Wrote {len(out)} epochs -> {out_path}")
 
 
 # Main driver
@@ -572,12 +485,13 @@ def main():
                 run_targets.append(tid)
         if not run_targets:
             raise FileNotFoundError(f"No targets with LOS and OEM found under {LOS_BASE_DIR} & {OEM_DIR}")
-        print(f"[RUN ] Looping over {len(run_targets)} targets: {run_targets}")
+        _log("INFO", f"[RUN ] Looping over {len(run_targets)} targets")
+        _log("DEBUG", f"[RUN ] Targets: {run_targets}")
         for tid in run_targets:
             try:
                 run_for_target(tid)
             except Exception as e:
-                print(f"[ERR ] Target {tid}: {e}")
+                _log("ERROR", f"[ERR ] Target {tid}: {e}")
     else:
         run_for_target(TARGET_ID)
 
@@ -587,16 +501,19 @@ def main():
         with manifest.open("w") as mf:
             mf.write(f"triangulation_run_id={RUN_ID}\n")
             mf.write(f"generated_utc={datetime.utcnow().isoformat()}Z\n")
-            mf.write(f"nsats={NSATS}\n")
-            mf.write(f"alt_km={ALT_KM:.3f}\n")
-            mf.write(f"inc_deg={INC_DEG:.3f}\n")
+            # Echo key config knobs that affected this run
+            mf.write(f"earth_radius_km={R_EARTH_KM}\n")
+            mf.write(f"min_observers={N_OBSERVERS}\n")
+            mf.write(f"sigma_los_rad={SIGMA_LOS}\n")
+            mf.write(f"beta_mode={BETA_PAIRS_MODE}\n")
+            mf.write(f"beta_summary_k={BETA_SUMMARY_K}\n")
             if LOOP_ALL_TARGETS:
                 mf.write("targets=\n")
                 for p in sorted(RUN_DIR.glob("xhat_geo_*.csv")):
                     mf.write(f"  - {p.stem.split('xhat_geo_')[-1]}\n")
-        print(f"[MAN ] Wrote {manifest}")
+        _log("INFO", f"[MAN ] Wrote {manifest}")
     except Exception as e:
-        print(f"[WARN] Could not write triangulation manifest: {e}")
+        _log("WARN", f"[WARN] Could not write triangulation manifest: {e}")
 
 if __name__ == "__main__":
     main()
