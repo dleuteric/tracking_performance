@@ -167,6 +167,20 @@ def interp_los_to_times(los: pd.DataFrame, times_utc: pd.DatetimeIndex) -> pd.Da
     out.index.name = "time"
     return out
 
+def _score_pair(u_i, u_j, elev_i=None, elev_j=None, cfg=None):
+    # β in deg
+    beta = np.degrees(np.arccos(np.clip(np.abs(np.dot(u_i, u_j)), -1.0, 1.0)))
+    # optional cap and min-beta gate
+    beta_eff = min(beta, cfg.beta_cap_deg)
+    if beta < cfg.min_beta_deg:
+        return -np.inf, beta  # reject
+    # optional same-plane penalty (until we wire real plane IDs)
+    if cfg.prefer_cross_plane and _same_plane_heuristic(i, j):
+        beta_eff = max(0.0, beta_eff - cfg.same_plane_penalty_deg)
+    s = np.sin(np.radians(beta_eff))
+    if cfg.use_elev_weight and (elev_i is not None) and (elev_j is not None):
+        s *= max(0.0, np.sin(np.radians(elev_i))) * max(0.0, np.sin(np.radians(elev_j)))
+    return s, beta
 # --------------------------
 # Geometry core
 # --------------------------
@@ -330,36 +344,48 @@ def run_for_target(target_id: str):
         los = _norm_time_utc(load_los(los_dir, target_id, obs), col="time")
         eph = _norm_time_utc(load_eph(obs), col="time")
         # trim to OEM span
-        t0,t1 = master_index.min(), master_index.max()
-        los = los[(los["time"]>=t0)&(los["time"]<=t1)]
-        eph = eph[(eph["time"]>=t0)&(eph["time"]<=t1)]
-        # interpolate both to OEM times
-        E = interp_ephem_to_times(eph, master_index)
-        U = interp_los_to_times(los, master_index)
-        common = E.index.intersection(U.index)
-        if len(common)==0:
-            _log("DEBUG", f"[JOIN] OBS {obs}: 0 rows on OEM epochs — skip")
+        t0, t1 = master_index.min(), master_index.max()
+        los = los[(los["time"] >= t0) & (los["time"] <= t1)]
+        eph = eph[(eph["time"] >= t0) & (eph["time"] <= t1)]
+
+        # Interpolate both to OEM times, then reindex to master_index (full length)
+        E = interp_ephem_to_times(eph, master_index).reindex(master_index)
+        U = interp_los_to_times(los, master_index).reindex(master_index)
+
+        # Valid epochs are where both ephem and LOS exist
+        pos_ok = E[["x_km","y_km","z_km"]].notna().all(axis=1)
+        los_ok = U[["ux","uy","uz"]].notna().all(axis=1)
+        valid_mask = (pos_ok & los_ok).to_numpy()
+        if not valid_mask.any():
+            _log("DEBUG", f"[JOIN] OBS {obs}: 0 valid rows on OEM epochs — skip")
             continue
+
+        # Build full‑length df aligned to master_index; fill values, and precompute visibility
         df = pd.DataFrame({
-            "x_km": E.loc[common, "x_km"].astype(float),
-            "y_km": E.loc[common, "y_km"].astype(float),
-            "z_km": E.loc[common, "z_km"].astype(float),
-            "ux":   U.loc[common, "ux"].astype(float),
-            "uy":   U.loc[common, "uy"].astype(float),
-            "uz":   U.loc[common, "uz"].astype(float),
-        }, index=common)
+            "x_km": E["x_km"].astype(float),
+            "y_km": E["y_km"].astype(float),
+            "z_km": E["z_km"].astype(float),
+            "ux":   U["ux"].astype(float),
+            "uy":   U["uy"].astype(float),
+            "uz":   U["uz"].astype(float),
+        }, index=master_index)
         df.index.name = "time"
-        # Pre-compute visibility vs TRUE target (Earth occlusion). Store as column 'vis'.
-        xt_common = truth.loc[common, ["x_km","y_km","z_km"]].to_numpy(float)
-        r_common  = df[["x_km","y_km","z_km"]].to_numpy(float)
+
+        # Earth occlusion only on valid epochs; others are not visible
+        xt_common = truth.loc[master_index, ["x_km","y_km","z_km"]].to_numpy(float)[valid_mask]
+        r_common  = df.loc[master_index, ["x_km","y_km","z_km"]].to_numpy(float)[valid_mask]
         blocked   = earth_blocks_ray_vec(r_common, xt_common, R_EARTH_KM)
-        df["vis"] = ~blocked
-        vis_count = int(df["vis"].sum())
+        vis = np.zeros(len(master_index), dtype=bool)
+        vis[valid_mask] = ~blocked
+        df["vis"] = vis
+
+        vis_count = int(vis.sum())
         if vis_count == 0:
             _log("DEBUG", f"[VIS ] OBS {obs}: 0 visible epochs after occlusion — drop")
             continue
+
         aligned[obs] = df
-        _log("DEBUG", f"[JOIN] OBS {obs}: {len(df)} rows (interp) | visible={vis_count}")
+        _log("DEBUG", f"[JOIN] OBS {obs}: {vis_count} visible rows (full index {len(df)})")
 
     if not aligned:
         raise RuntimeError("No observers aligned to OEM epochs.")
@@ -384,11 +410,10 @@ def run_for_target(target_id: str):
         used_ids: List[str] = []
 
         for obs, df in aligned.items():
-            if tstamp not in df.index:
+            # fast positional access (all dfs are reindexed to master_index)
+            if not bool(df["vis"].iloc[k]):
                 continue
-            if ("vis" in df.columns) and (not bool(df.at[tstamp, "vis"])):
-                continue
-            row = df.loc[tstamp]
+            row = df.iloc[k]
             r = np.array([row["x_km"], row["y_km"], row["z_km"]], float)
             u = np.array([row["ux"], row["uy"], row["uz"]], float)
             rs.append(r); us.append(u); used_ids.append(obs)
