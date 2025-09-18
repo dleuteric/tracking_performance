@@ -35,6 +35,16 @@ run_id:
     alt_km: 0
     inc_deg: 0
 
+triangulation:
+  selection:
+    mode: best_pair        # [all | best_pair | best_triplet]
+    beta_cap_deg: 120      # hard cap in scoring (use min(β, beta_cap))
+    min_beta_deg: 20       # reject pairs below this
+    prefer_cross_plane: true
+    same_plane_penalty_deg: 10   # subtract this from β if same plane (proxy until plane IDs wired)
+    use_elev_weight: true
+    min_nsats_epoch: 2      # gate
+
 geometry:
   frame: ICRF                # coerente con i nostri export
   # Terra per occlusione geometrica
