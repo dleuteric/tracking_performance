@@ -15,7 +15,7 @@ Controls:
     alpha_fn(t, state) -> attack angle [rad]
     bank_fn(t, state)  -> bank angle [rad]
 
-TODO (future steps): replace placeholder aero coeffs, exponential atmos,
+Next (future steps): replace placeholder aero coeffs, exponential atmos,
 and constant control laws with paper's alpha(v) schedule & maneuver logic.
 """
 
