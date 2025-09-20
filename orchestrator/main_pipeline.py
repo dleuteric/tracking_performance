@@ -59,6 +59,7 @@ FLAGS = {
     "RUN_TRIANGULATION": True,  # if False -> reuse existing triangulation
     "RUN_GEOM_PLOTS": True,
     "RUN_FILTER_FORWARD": None,
+    "USE_EWRLS": True,  # if True, replace legacy CV-KF forward filter with EW-RLS
     "RUN_FILTER_PLOTS": None,
     "RUN_INTERACTIVE_3D": None,
     "REUSE_TRIANGULATION": None,  # when RUN_TRIANGULATION is False: adopt latest triangulation RUN_ID
@@ -87,6 +88,7 @@ FLAGS["RUN_GEOM_PLOTS"] = _env_bool("RUN_GPLT", FLAGS["RUN_GEOM_PLOTS"]) if FLAG
 FLAGS["RUN_FILTER_FORWARD"] = _env_bool("RUN_FWD", FLAGS["RUN_FILTER_FORWARD"]) if FLAGS[
                                                                                        "RUN_FILTER_FORWARD"] is None else \
 FLAGS["RUN_FILTER_FORWARD"]
+FLAGS["USE_EWRLS"] = _env_bool("USE_EWRLS", FLAGS["USE_EWRLS"]) if FLAGS["USE_EWRLS"] is None else FLAGS["USE_EWRLS"]
 FLAGS["RUN_FILTER_PLOTS"] = _env_bool("RUN_FPLT", FLAGS["RUN_FILTER_PLOTS"]) if FLAGS["RUN_FILTER_PLOTS"] is None else \
 FLAGS["RUN_FILTER_PLOTS"]
 FLAGS["RUN_INTERACTIVE_3D"] = _env_bool("RUN_I3D", FLAGS["RUN_INTERACTIVE_3D"]) if FLAGS[
@@ -134,6 +136,41 @@ def _tri_run_has_csvs(run_id: str) -> bool:
     if csv_files:
         _log("DEBUG", f"Found {len(csv_files)} triangulation CSVs in {run_id}")
     return bool(csv_files)
+
+def _find_tri_csv(run_id: str) -> Path:
+    """Return the most recent triangulation CSV for a run."""
+    run_dir = TRI_DIR / run_id
+    candidates = sorted(run_dir.glob("xhat_geo_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No triangulation CSVs in {run_dir}")
+    return candidates[0]
+def step_ewrls(run_id: str):
+    """Run EW-RLS estimator on triangulated positions and write tracks under TRACKS_DIR/RUN_ID."""
+    _ensure_pkg_path()
+    os.environ["RUN_ID"] = run_id
+    try:
+        from estimationandfiltering.ew_rls import run_ewrls_on_csv
+        _log("INFO", "[STEP] EW-RLS estimation starting...", _get_run_metadata(run_id))
+        start_time = datetime.now()
+        tri_csv = _find_tri_csv(run_id)
+        out_dir = (TRACKS_DIR / run_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = str(out_dir / "ewrls_tracks.csv")
+        # Frame preference: from CFG if present, else default
+        frame = str(CFG.get("frames", {}).get("triangulation_frame", "ECEF"))
+        theta = float(CFG.get("estimation", {}).get("ewrls_theta", 0.93))
+        order = int(CFG.get("estimation", {}).get("ewrls_order", 4))
+        run_ewrls_on_csv(str(tri_csv), out_csv=out_csv, frame=frame, order=order, theta=theta)
+        duration = (datetime.now() - start_time).total_seconds()
+        _log("INFO", f"[STEP] EW-RLS ✓ wrote {out_csv} in {duration:.1f}s")
+        return True
+    except Exception as e:
+        _log("ERROR", f"[ERR ] EW-RLS failed: {e}")
+        traceback.print_exc()
+        if FLAGS["CONTINUE_ON_ERROR"]:
+            _log("WARN", "[CONT] Continuing despite EW-RLS error")
+            return False
+        raise
 
 
 def _resolve_reusable_run_id(preferred: str | None) -> str:
@@ -298,6 +335,7 @@ def main():
     _log("INFO", f"  • Triangulation    : {'RUN' if run_tri else 'SKIP/REUSE'}")
     _log("INFO", f"  • Geometry Plots   : {'RUN' if run_gplt else 'SKIP'}")
     _log("INFO", f"  • Filter Forward   : {'RUN' if run_fwd else 'SKIP'}")
+    _log("INFO", f"  • Use EW-RLS      : {'YES' if FLAGS['USE_EWRLS'] else 'NO'}")
     _log("INFO", f"  • Filter Plots     : {'RUN' if run_fplt else 'SKIP'}")
     _log("INFO", f"  • Interactive 3D   : {'RUN' if run_i3d else 'SKIP'}")
     _log("INFO", f"  • Continue on Error: {'YES' if FLAGS['CONTINUE_ON_ERROR'] else 'NO'}")
@@ -347,10 +385,14 @@ def main():
         if step_geom_plots(run_id):
             completed_steps.append("geom_plots")
 
-    # 3) Filtering forward pass (EFM)
+    # 3) Estimation step
     if run_fwd:
-        if step_filter_forward(run_id):
-            completed_steps.append("filter_forward")
+        if FLAGS["USE_EWRLS"]:
+            if step_ewrls(run_id):
+                completed_steps.append("ewrls_forward")
+        else:
+            if step_filter_forward(run_id):
+                completed_steps.append("filter_forward")
 
     # 4) Filter performance / interactive plots
     if run_fplt:
@@ -371,7 +413,7 @@ def main():
     _log("INFO", f"       Triangulation: {TRI_DIR / run_id}")
     if "geom_plots" in completed_steps:
         _log("INFO", f"       Geom plots   : {PLOTS_GEOM_DIR / run_id}")
-    if "filter_forward" in completed_steps:
+    if "filter_forward" in completed_steps or "ewrls_forward" in completed_steps:
         _log("INFO", f"       Tracks       : {TRACKS_DIR / run_id}")
     if "filter_plots" in completed_steps or "interactive_3d" in completed_steps:
         _log("INFO", f"       Filter plots : {PLOTS_FILT_DIR / run_id}")
