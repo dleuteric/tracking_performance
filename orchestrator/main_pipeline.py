@@ -58,7 +58,7 @@ def _log(level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
 FLAGS = {
     "RUN_TRIANGULATION": True,  # if False -> reuse existing triangulation
     "RUN_GEOM_PLOTS": True,
-    "RUN_FILTER_FORWARD": None,
+    "RUN_FILTER_FORWARD": True,  # Default is True so estimation step runs by default
     "USE_EWRLS": True,  # if True, replace legacy CV-KF forward filter with EW-RLS
     "RUN_FILTER_PLOTS": None,
     "RUN_INTERACTIVE_3D": None,
@@ -107,8 +107,14 @@ FLAGS["FORCE_RUN_ID"] = _env("RUN_ID", FLAGS["FORCE_RUN_ID"]) if FLAGS["FORCE_RU
 # ---------------- Helpers ----------------
 
 def _ensure_pkg_path():
+    # ensure project root is importable
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
+    # also allow typical source roots like <root>/src or <root>/packages
+    for extra in ("src", "packages"):
+        p = PROJECT_ROOT / extra
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
 
 
 def _validate_directories():
@@ -145,24 +151,38 @@ def _find_tri_csv(run_id: str) -> Path:
         raise FileNotFoundError(f"No triangulation CSVs in {run_dir}")
     return candidates[0]
 def step_ewrls(run_id: str):
-    """Run EW-RLS estimator on triangulated positions and write tracks under TRACKS_DIR/RUN_ID."""
+    """Run EW-RLS estimator on ALL triangulated positions (xhat_geo_*.csv) for this run.
+    Writes tracks under TRACKS_DIR/RUN_ID as ewrls_tracks_<target>.csv
+    """
     _ensure_pkg_path()
     os.environ["RUN_ID"] = run_id
     try:
         from estimationandfiltering.ew_rls import run_ewrls_on_csv
         _log("INFO", "[STEP] EW-RLS estimation starting...", _get_run_metadata(run_id))
         start_time = datetime.now()
-        tri_csv = _find_tri_csv(run_id)
+
+        tri_dir = TRI_DIR / run_id
+        tri_list = sorted(tri_dir.glob("xhat_geo_*.csv"))
+        if not tri_list:
+            raise FileNotFoundError(f"No triangulation CSVs in {tri_dir}")
+
         out_dir = (TRACKS_DIR / run_id)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_csv = str(out_dir / "ewrls_tracks.csv")
-        # Frame preference: from CFG if present, else default
+
+        # Frame + params from config (with safe defaults)
         frame = str(CFG.get("frames", {}).get("triangulation_frame", "ECEF"))
         theta = float(CFG.get("estimation", {}).get("ewrls_theta", 0.93))
         order = int(CFG.get("estimation", {}).get("ewrls_order", 4))
-        run_ewrls_on_csv(str(tri_csv), out_csv=out_csv, frame=frame, order=order, theta=theta)
+
+        n_ok = 0
+        for tri_csv in tri_list:
+            tgt = tri_csv.stem.replace("xhat_geo_", "")
+            out_csv = str(out_dir / f"ewrls_tracks_{tgt}.csv")
+            run_ewrls_on_csv(str(tri_csv), out_csv=out_csv, frame=frame, order=order, theta=theta)
+            n_ok += 1
+
         duration = (datetime.now() - start_time).total_seconds()
-        _log("INFO", f"[STEP] EW-RLS ✓ wrote {out_csv} in {duration:.1f}s")
+        _log("INFO", f"[STEP] EW-RLS ✓ wrote {n_ok} track files to {out_dir} in {duration:.1f}s")
         return True
     except Exception as e:
         _log("ERROR", f"[ERR ] EW-RLS failed: {e}")
@@ -208,6 +228,7 @@ def _get_run_metadata(run_id: str) -> Dict[str, Any]:
 
 def step_triangulation():
     _ensure_pkg_path()
+    _log("DEBUG", f"sys.path[0:3]={sys.path[0:3]}")
     try:
         import geometry.triangulate_icrf as tri
         _log("INFO", "[STEP] Triangulation starting...")
@@ -335,7 +356,7 @@ def main():
     _log("INFO", f"  • Triangulation    : {'RUN' if run_tri else 'SKIP/REUSE'}")
     _log("INFO", f"  • Geometry Plots   : {'RUN' if run_gplt else 'SKIP'}")
     _log("INFO", f"  • Filter Forward   : {'RUN' if run_fwd else 'SKIP'}")
-    _log("INFO", f"  • Use EW-RLS      : {'YES' if FLAGS['USE_EWRLS'] else 'NO'}")
+    _log("INFO", f"  • Use EW-RLS       : {'YES' if FLAGS['USE_EWRLS'] else 'NO'}")
     _log("INFO", f"  • Filter Plots     : {'RUN' if run_fplt else 'SKIP'}")
     _log("INFO", f"  • Interactive 3D   : {'RUN' if run_i3d else 'SKIP'}")
     _log("INFO", f"  • Continue on Error: {'YES' if FLAGS['CONTINUE_ON_ERROR'] else 'NO'}")
