@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import yaml
 import re
+import sys
 
 # ---------- Paths / config ----------
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,25 +68,32 @@ def read_estimator_csv(csv_path: Path) -> pd.DataFrame:
             n=c.lower()
             if any(cc in n for cc in cands): return c
         raise KeyError(f"Missing columns {cands} in {csv_path.name}")
-    tcol = pick(df, ["t_s","time_s","t","epoch_s"])
-    xcol = pick(df, ["x_km","x_icrf_km","x_ecef_km","x"])
-    ycol = pick(df, ["y_km","y_icrf_km","y_ecef_km","y"])
-    zcol = pick(df, ["z_km","z_icrf_km","z_ecef_km","z"])
+    tcol = pick(df, ["t_s","time_s","t","epoch_s","time"])
+    xcol = pick(df, ["x_icrf_km","x_km","x_ecef_km","x","x_icrf_m","x_ecef_m","x_m"])
+    ycol = pick(df, ["y_icrf_km","y_km","y_ecef_km","y","y_icrf_m","y_ecef_m","y_m"])
+    zcol = pick(df, ["z_icrf_km","z_km","z_ecef_km","z","z_icrf_m","z_ecef_m","z_m"])
     # Units: if looks like meters, convert
-    def is_m(col): return col.endswith("_m") or col.endswith("_icrf_m") or col.endswith("_ecef_m")
+    def is_m(col): return str(col).endswith("_m")
     scale = 1000.0 if (is_m(xcol) or is_m(ycol) or is_m(zcol)) else 1.0
     # Time: allow ISO
     t = df[tcol]
     try: t_s = t.astype(float).to_numpy()
     except Exception:
-        t_s = pd.to_datetime(t, utc=True).astype("int64").to_numpy()/1e9
+        # if it's ISO strings
+        t_s = pd.to_datetime(t, utc=True, errors="coerce")
+        if t_s.isna().any():
+            t_s = pd.to_datetime(t, errors="coerce")
+        if hasattr(t_s, "astype"):
+            t_s = t_s.astype("int64").to_numpy()/1e9
+        else:  # DatetimeIndex
+            t_s = t_s.view("int64")/1e9
     out = pd.DataFrame({
         "t_s": t_s,
         "x_km": df[xcol].astype(float).to_numpy()/scale,
         "y_km": df[ycol].astype(float).to_numpy()/scale,
         "z_km": df[zcol].astype(float).to_numpy()/scale,
     })
-    return out
+    return out.sort_values("t_s").reset_index(drop=True)
 
 def extract_target_id(name: str) -> str:
     # HGV_00001, HGV-00001, ewrls_icrf_HGV_00001, kf_HGV_00001, etc.
@@ -114,6 +122,15 @@ def metrics_from_errors(err: Dict[str,np.ndarray]) -> Dict[str,float]:
     cep50 = float(np.percentile(et, 50))
     cep90 = float(np.percentile(et, 90))
     return {"RMSE3D_m": rmse, "CEP50_m": cep50, "CEP90_m": cep90}
+
+def rms_between(kf: pd.DataFrame, ew: pd.DataFrame) -> float:
+    """RMS 3D distance (m) between KF and EW after time alignment via interpolation."""
+    t = kf["t_s"].to_numpy(float)
+    def interp_col(df, col): return np.interp(t, df["t_s"].to_numpy(float), df[col].to_numpy(float))
+    dx = (kf["x_km"].to_numpy(float) - interp_col(ew, "x_km"))*1000.0
+    dy = (kf["y_km"].to_numpy(float) - interp_col(ew, "y_km"))*1000.0
+    dz = (kf["z_km"].to_numpy(float) - interp_col(ew, "z_km"))*1000.0
+    return float(np.sqrt(np.nanmean(dx*dx + dy*dy + dz*dz)))
 
 # ---------- Plots ----------
 COL_TRUTH = "#7f7f7f"
@@ -174,25 +191,35 @@ def plot_errors_overlay(tgt: str, ekf: Optional[Dict[str,np.ndarray]], eew: Opti
     out_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_dir/f"{tgt}_errors_overlay.png", dpi=180, bbox_inches="tight"); plt.close(fig)
 
+# ---------- Discovery (robust, no collisions) ----------
+def _discover_kf(run_id: str) -> List[Path]:
+    # KF legacy: exports/tracks/<RUN_ID>/HGV_*_track_icrf_forward.csv
+    base = ROOT / f"exports/tracks/{run_id}"
+    return sorted(base.glob("HGV_*_track_icrf_forward.csv"))
+
+def _discover_ew(run_id: str) -> List[Path]:
+    # Prefer EW files that are NOT the KF compatibility ones
+    base = ROOT / f"exports/tracks/{run_id}"
+    ew = sorted(base.glob("ewrls_tracks_HGV_*.csv"))
+    if ew:
+        return ew
+    # Fallback to new icrf folder pattern
+    alt = ROOT / f"exports/tracks_icrf/{run_id}"
+    return sorted(alt.glob("ewrls_icrf_HGV_*.csv"))
+
 # ---------- Main compare ----------
 def compare_run(run_id: str,
-                kf_glob1: str, kf_glob2: str,
-                ew_glob: str,
-                out_dir: Path, cfg: Optional[str]=None) -> pd.DataFrame:
+                out_dir: Path,
+                cfg: Optional[str]=None) -> pd.DataFrame:
     paths = load_paths(cfg)
     oem_root = paths["oem_root"]
 
-    # discover files
-    ew_files = sorted((ROOT / ew_glob.format(RUN_ID=run_id)).glob("*")) if "{RUN_ID}" in ew_glob else sorted(Path(ew_glob).glob("*"))
-    if not ew_files:
-        ew_dir = ROOT / f"exports/tracks_icrf/{run_id}"
-        ew_files = sorted(ew_dir.glob("ewrls_icrf_*.csv"))
+    ew_files = _discover_ew(run_id)
+    kf_files = _discover_kf(run_id)
 
-    kf_files: List[Path] = []
-    for pat in (kf_glob1, kf_glob2):
-        base = (ROOT / pat.format(RUN_ID=run_id))
-        if base.exists():
-            kf_files.extend(sorted(base.glob("*.csv")))
+    if not ew_files and not kf_files:
+        raise FileNotFoundError(f"No estimator CSVs found for run {run_id}")
+
     # Index by target
     ew_by_tgt = {extract_target_id(p.name): p for p in ew_files}
     kf_by_tgt = {extract_target_id(p.name): p for p in kf_files}
@@ -210,6 +237,15 @@ def compare_run(run_id: str,
 
         kf_df = read_estimator_csv(kf_by_tgt[tgt]) if tgt in kf_by_tgt else None
         ew_df = read_estimator_csv(ew_by_tgt[tgt]) if tgt in ew_by_tgt else None
+
+        # Sanity: warn if exactly identical after alignment
+        if kf_df is not None and ew_df is not None:
+            try:
+                rmsm = rms_between(kf_df, ew_df)
+                if rmsm < 1e-6:
+                    print(f"[WARN] {tgt}: KF and EW are numerically identical (RMS {rmsm:.3e} m). Check inputs.")
+            except Exception as _:
+                pass
 
         # plots
         plot_3d_overlay(tgt, kf_df, ew_df, tru, out_dir)
@@ -230,7 +266,8 @@ def compare_run(run_id: str,
         with (out_dir / "README.md").open("w") as f:
             f.write(f"# Estimator comparison — {run_id}\n\n")
             f.write("**KF (legacy)** vs **EW-RLS (poly RLS)**, truth = OEM ICRF\n\n")
-            f.write(df.to_markdown(index=False))
+            if not df.empty:
+                f.write(df.to_markdown(index=False))
     return df
 
 # ---------- CLI ----------
@@ -239,17 +276,16 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Compare KF vs EW-RLS against OEM ICRF; overlay plots + metrics.")
     ap.add_argument("--run_id", required=True)
     ap.add_argument("--out_dir", default=None, help="defaults to exports/compare/<RUN_ID>")
-    # KF discovery patterns (first that exists is used)
-    ap.add_argument("--kf_glob1", default="exports/tracks/{RUN_ID}/*kf*/", help="dir pattern containing KF CSVs")
-    ap.add_argument("--kf_glob2", default="exports/tracks/{RUN_ID}/", help="fallback dir containing KF CSVs")
-    # EW directory/pattern (default to our new tracks_icrf)
-    ap.add_argument("--ew_glob", default="exports/tracks_icrf/{RUN_ID}/", help="dir pattern containing EW-RLS CSVs")
     ap.add_argument("--config", default=str(CFG_PATH))
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir) if args.out_dir else (ROOT / f"exports/compare/{args.run_id}")
-    df = compare_run(args.run_id, args.kf_glob1, args.kf_glob2, args.ew_glob, out_dir, cfg=args.config)
+    df = compare_run(args.run_id, out_dir, cfg=args.config)
     if df.empty:
         print("[WARN] No metrics computed (no targets?)")
     else:
+        # Summary line, robust to missing columns
+        kf_mean = df.filter(like="KF_RMSE3D_m").values.mean() if any(c.startswith("KF_RMSE3D_m") for c in df.columns) else float("nan")
+        ew_mean = df.filter(like="EW_RMSE3D_m").values.mean() if any(c.startswith("EW_RMSE3D_m") for c in df.columns) else float("nan")
+        print(f"[MET ] targets={len(df)} | KF_RMSE3D(m) mean={np.nanmean([kf_mean]):.0f} | EW_RMSE3D(m) mean={np.nanmean([ew_mean]):.0f}")
         print(f"[OK] Saved metrics and plots → {out_dir}")
