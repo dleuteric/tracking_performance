@@ -126,7 +126,7 @@ def main(sigmas_urad: Optional[List[float]] = None, keep_tmp_cfgs: bool = True):
         cfg_sigmas = base_cfg.get("studies", {}).get("los_sigma_urad", None)
     except Exception:
         cfg_sigmas = None
-    sigmas = sigmas_urad or cfg_sigmas or [50, 75, 100, 150, 200, 300]
+    sigmas = sigmas_urad or cfg_sigmas or [50, 300]
 
     study_id = make_study_id("LOS_SWEEP")
     study_root = ROOT / "exports" / "studies" / study_id
