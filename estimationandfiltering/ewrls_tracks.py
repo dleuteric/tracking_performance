@@ -67,7 +67,7 @@ def read_tri(csv_path: Path) -> Dict[str, Any]:
             if c in df.columns:
                 dt = pd.to_datetime(df[c], utc=True, errors="coerce")
                 t = dt.astype("int64") / 1e9
-                t_iso = dt.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                t_iso = dt.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").to_numpy()
                 break
         else:
             raise ValueError(f"{csv_path.name}: no time column")
@@ -99,40 +99,69 @@ def read_tri(csv_path: Path) -> Dict[str, Any]:
         cols = ", ".join(df.columns)
         raise ValueError(f"{csv_path.name}: missing x/y/z columns. Available: [{cols}]")
 
-    return {"t": np.asarray(t), "t_iso": np.asarray(t_iso), "x": x, "y": y, "z": z}
+    # --- ensure samples are time-sorted (tri files can be out-of-order) ---
+    order = np.argsort(t)
+    t = np.asarray(t)[order]
+    t_iso = np.asarray(t_iso)[order]
+    x = np.asarray(x)[order]
+    y = np.asarray(y)[order]
+    z = np.asarray(z)[order]
+
+    return {"t": t, "t_iso": t_iso, "x": x, "y": y, "z": z}
 
 
 def read_truth(csv_path: Path) -> Dict[str, Any]:
     df = pd.read_csv(csv_path)
-    if "t_s" in df.columns and np.issubdtype(df["t_s"].dtype, np.number):
+
+    # --- time (s) ---
+    if "t_s" in df.columns:
         t = df["t_s"].astype(float).to_numpy()
     else:
+        # fallback (rare)
         for c in ["time", "epoch", "t", "utc", "timestamp"]:
             if c in df.columns:
-                t = pd.to_datetime(df[c], utc=True, errors="coerce").astype("int64") / 1e9
+                t = pd.to_datetime(df[c], utc=True, errors="coerce").astype("int64")/1e9
                 break
         else:
             raise ValueError(f"{csv_path.name}: no time column")
 
-    def get(colnames: List[str]):
-        for c in colnames:
-            if c in df.columns:
-                return df[c].astype(float).to_numpy()
-        raise ValueError(f"{csv_path.name}: missing one of {colnames}")
+    # --- position: prefer HGV meters, convert to km ---
+    if {"x_m","y_m","z_m"}.issubset(df.columns):
+        x = (df["x_m"].astype(float) / 1000.0).to_numpy()
+        y = (df["y_m"].astype(float) / 1000.0).to_numpy()
+        z = (df["z_m"].astype(float) / 1000.0).to_numpy()
+    else:
+        # legacy / alternate names already supported
+        def get(colnames):
+            for c in colnames:
+                if c in df.columns:
+                    return df[c].astype(float).to_numpy()
+            raise ValueError(f"{csv_path.name}: missing one of {colnames}")
+        x = get(["x_icrf_km","x_km","x"])
+        y = get(["y_icrf_km","y_km","y"])
+        z = get(["z_icrf_km","z_km","z"])
 
-    x = get(["x_icrf_km", "x_km", "x"]) 
-    y = get(["y_icrf_km", "y_km", "y"])
-    z = get(["z_icrf_km", "z_km", "z"])
-    return {"t": np.asarray(t), "x": x, "y": y, "z": z}
+    # (optional) velocities in m/s if ti servono dopo:
+    # vx = df.get("vx_mps"); vy = df.get("vy_mps"); vz = df.get("vz_mps")
 
+    # ensure time-sorted
+    o = np.argsort(t)
+    return {"t": np.asarray(t)[o],
+            "x": np.asarray(x)[o],
+            "y": np.asarray(y)[o],
+            "z": np.asarray(z)[o]}
 # ---------------- Truth discovery ----------------
 def find_truth_file(truth_base: Path, run_id: str, tgt: str) -> Optional[Path]:
+    # Primary locations under truth_base (with/without per-run subfolder)
     candidates = [
         truth_base / run_id / f"{tgt}_truth.csv",
         truth_base / run_id / f"truth_{tgt}.csv",
         truth_base / run_id / f"{tgt}.csv",
         truth_base / run_id / "targets" / f"{tgt}_truth.csv",
         truth_base / run_id / "targets" / f"{tgt}.csv",
+        # Known external drop (no per-run): exports/target_exports/OUTPUT_CSV/<TGT>.csv
+        ROOT / "exports/target_exports/OUTPUT_CSV" / f"{tgt}.csv",
+        ROOT / "exports/target_exports" / f"{tgt}.csv",
     ]
     for p in candidates:
         if p.exists():
