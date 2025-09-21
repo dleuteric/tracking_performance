@@ -3,22 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import subprocess, sys, time, datetime as dt
-import numpy as np
 import pandas as pd
 import yaml
 
-# --------------------------------------------------------------------------------------
-# Paths / binaries
-# --------------------------------------------------------------------------------------
 ROOT        = Path(__file__).resolve().parents[1]
 CFG_PATH    = ROOT / "config/pipeline.yaml"
 ORCH_PY     = ROOT / "orchestrator" / "main_pipeline.py"
 COMPARE_PY  = ROOT / "estimationandfiltering" / "compare_estimators.py"
 TRI_ROOT    = ROOT / "exports" / "triangulation"
 
-# --------------------------------------------------------------------------------------
-# Utils
-# --------------------------------------------------------------------------------------
 def load_cfg(path: Path) -> Dict[str, Any]:
     with open(path, "r") as f:
         return yaml.safe_load(f)
@@ -38,12 +31,6 @@ def latest_tri_run_id() -> str:
     runs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return runs[0].name
 
-def fmt_sigma_label(sigma_urad: int | float) -> str:
-    return f"{int(sigma_urad)}urad" if float(sigma_urad).is_integer() else f"{sigma_urad}urad"
-
-# --------------------------------------------------------------------------------------
-# Steps
-# --------------------------------------------------------------------------------------
 def run_orchestrator(cfg_path: Path) -> str:
     t0 = time.time()
     cmd = [sys.executable, str(ORCH_PY), "--config", str(cfg_path)]
@@ -58,11 +45,6 @@ def run_orchestrator(cfg_path: Path) -> str:
     return rid
 
 def run_compare(run_id: str, out_dir: Path) -> pd.DataFrame:
-    """
-    Confronta KF vs EW-RLS per questa run, leggendo:
-      KF → exports/tracks/{RUN_ID}/*_track_icrf_forward.csv
-      EW → exports/tracks/{RUN_ID}/ewrls_tracks_*.csv
-    """
     t0 = time.time()
     kf_glob = "exports/tracks/{RUN_ID}/*_track_icrf_forward.csv"
     ew_glob = "exports/tracks/{RUN_ID}/ewrls_tracks_*.csv"
@@ -114,19 +96,9 @@ def plot_summary(df_all: pd.DataFrame, out_dir: Path) -> Path:
     fig.savefig(png, dpi=160, bbox_inches="tight"); plt.close(fig)
     return png
 
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
-def main(sigmas_urad: Optional[List[float]] = None, keep_tmp_cfgs: bool = True):
+def main():
     base_cfg = load_cfg(CFG_PATH)
-
-    # 1) leggi lista σ_LOS [µrad] dal config (fallback a CLI/default)
-    cfg_sigmas = None
-    try:
-        cfg_sigmas = base_cfg.get("studies", {}).get("los_sigma_urad", None)
-    except Exception:
-        cfg_sigmas = None
-    sigmas = sigmas_urad or cfg_sigmas or [50, 300]
+    sigmas = [50, 300]  # µrad
 
     study_id = make_study_id("LOS_SWEEP")
     study_root = ROOT / "exports" / "studies" / study_id
@@ -137,10 +109,9 @@ def main(sigmas_urad: Optional[List[float]] = None, keep_tmp_cfgs: bool = True):
 
     for sigma in sigmas:
         t_sigma = time.time()
-        label = fmt_sigma_label(sigma)
+        label = f"{sigma}urad"
         print(f"\n=== σ_LOS = {sigma} µrad ===")
 
-        # 2) genera config per-sigma (µrad → rad) + uuid/identità della run delegata al main
         cfg2 = base_cfg.copy()
         cfg2.setdefault("geometry", {}).setdefault("measurement_noise", {})
         cfg2["geometry"]["measurement_noise"]["los_sigma"] = float(sigma) * 1e-6
@@ -148,10 +119,7 @@ def main(sigmas_urad: Optional[List[float]] = None, keep_tmp_cfgs: bool = True):
         save_cfg(cfg2, cfg_run)
         print(f"[CFG ] los_sigma={cfg2['geometry']['measurement_noise']['los_sigma']:.6e} rad | {cfg_run.name}")
 
-        # 3) lancia il main (fa triangolazione + KF + EW-RLS)
         run_id = run_orchestrator(cfg_run)
-
-        # 4) compara KF vs EW-RLS leggendo i file della run
         compare_dir = study_root / f"compare_{label}"
         df = run_compare(run_id, compare_dir)
 
@@ -168,29 +136,11 @@ def main(sigmas_urad: Optional[List[float]] = None, keep_tmp_cfgs: bool = True):
         print("[FATAL] No metrics collected. Aborting summary.")
         return
 
-    # 5) summary finale
     big = pd.concat(all_rows, ignore_index=True)
     big.to_csv(study_root / "metrics_all.csv", index=False)
     summary_png = plot_summary(big, study_root)
     print(f"\n[OK  ] Study complete → {study_root}")
     print(f"[FIG ] {summary_png}")
 
-    # opzionale: pulizia dei cfg per-sigma
-    if not keep_tmp_cfgs:
-        for p in study_root.glob("pipeline_sigma*.yaml"):
-            try: p.unlink()
-            except Exception:
-                pass
-
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="LOS parametric study: orchestrator (triang+KF+EW) + compare + summary.")
-    ap.add_argument("--sigmas_urad", nargs="+", type=float, default=None,
-                    help="Override list of LOS sigmas in µrad (otherwise read from config.studies.los_sigma_urad)")
-    ap.add_argument("--rm_cfgs", action="store_true", help="Remove temporary per-sigma cfg files at the end.")
-    args = ap.parse_args()
-
-    main(sigmas_urad=args.sigmas_urad, keep_tmp_cfgs=(not args.rm_cfgs))
+    main()
