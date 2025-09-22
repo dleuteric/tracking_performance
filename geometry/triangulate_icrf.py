@@ -165,6 +165,31 @@ def _ensure_utc_index(idx) -> pd.DatetimeIndex:
             s = s.tz_localize("UTC")
         return pd.DatetimeIndex(s)
 
+def _to_epoch_s(ts_like) -> np.ndarray:
+    # accetta Series/Index con o senza tz, restituisce float seconds
+    idx = pd.to_datetime(ts_like, errors="coerce")
+    if isinstance(idx, pd.Series):
+        idx = idx.dt.tz_localize("UTC") if idx.dt.tz is None else idx.dt.tz_convert("UTC")
+        return (idx.view("int64") / 1e9).to_numpy()
+    else:
+        idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+        return (idx.view("int64") / 1e9)
+
+def _nearest_dt_seconds(t_ref_s: np.ndarray, t_grid_s: np.ndarray) -> np.ndarray:
+    # per ogni t_ref, trova il vicino in t_grid e ritorna Δt = t_ref - t_near
+    idx = np.searchsorted(t_grid_s, t_ref_s)
+    idx = np.clip(idx, 1, len(t_grid_s) - 1)
+    prev = t_grid_s[idx - 1]
+    nxt  = t_grid_s[idx]
+    t_near = np.where(np.abs(t_ref_s - prev) <= np.abs(t_ref_s - nxt), prev, nxt)
+    return t_ref_s - t_near
+
+def _dt_stats(label: str, dt: np.ndarray):
+    if dt.size == 0:
+        _log("WARN", f"[DT  ] {label}: series vuota")
+        return
+    _log("INFO", f"[DT  ] {label}: min={dt.min():.3f}s  med={np.median(dt):.3f}s  max={dt.max():.3f}s")
+
 def interp_ephem_to_times(eph: pd.DataFrame, times_utc: pd.DatetimeIndex) -> pd.DataFrame:
     # porta l'ephemeris su indice 'time' in UTC
     if "time" in eph.columns:
@@ -393,6 +418,9 @@ def run_for_target(target_id: str):
     master_index = truth.index
     _log("INFO", f"[TRUTH] OEM epochs: {len(master_index)} from {oem_path.name}")
 
+    # CSV di diagnostica Δt per l’intera run
+    dt_diag_rows = []
+
     # Build aligned per-observer tables on the master OEM epochs
     aligned: Dict[str, pd.DataFrame] = {}
     for obs in obs_all:
@@ -403,9 +431,55 @@ def run_for_target(target_id: str):
         los = los[(los["time"] >= t0) & (los["time"] <= t1)]
         eph = eph[(eph["time"] >= t0) & (eph["time"] <= t1)]
 
+        # --- Δt GREZZO tra LOS e EPHEM (come da checker) ---
+        t_los_raw = _to_epoch_s(los["time"])
+        t_eph_raw = _to_epoch_s(eph["time"])
+        dt_raw = _nearest_dt_seconds(t_los_raw, t_eph_raw)
+        _dt_stats(f"{obs} raw(LOS vs EPH)", dt_raw)
+
+        # salva qualche riga per report
+        if dt_raw.size:
+            dt_diag_rows.append({
+                "observer": obs,
+                "phase": "raw",
+                "dt_min_s": float(np.min(dt_raw)),
+                "dt_med_s": float(np.median(dt_raw)),
+                "dt_max_s": float(np.max(dt_raw)),
+                "n": int(dt_raw.size),
+            })
+
         # Interpolate both to OEM times, then reindex to master_index (full length)
         E = interp_ephem_to_times(eph, master_index).reindex(master_index)
         U = interp_los_to_times(los, master_index).reindex(master_index)
+
+        # --- Δt POST-ALLINEAMENTO (su OEM master_index) ---
+        t_oem = _to_epoch_s(master_index)
+        # Nota: E e U sono già reindicizzati su master_index
+        t_e = t_oem[E[["x_km", "y_km", "z_km"]].notna().all(axis=1).to_numpy()]
+        t_u = t_oem[U[["ux", "uy", "uz"]].notna().all(axis=1).to_numpy()]
+
+        # confronta entrambe con i tempi OEM stessi (devono stare a 0, entro numerica)
+        dt_e = t_e - t_oem[:len(t_e)]
+        dt_u = t_u - t_oem[:len(t_u)]
+        _dt_stats(f"{obs} post(EPH on OEM)", dt_e)
+        _dt_stats(f"{obs} post(LOS on OEM)", dt_u)
+
+        if dt_e.size:
+            dt_diag_rows.append({
+                "observer": obs, "phase": "post_eph",
+                "dt_min_s": float(np.min(dt_e)),
+                "dt_med_s": float(np.median(dt_e)),
+                "dt_max_s": float(np.max(dt_e)),
+                "n": int(dt_e.size),
+            })
+        if dt_u.size:
+            dt_diag_rows.append({
+                "observer": obs, "phase": "post_los",
+                "dt_min_s": float(np.min(dt_u)),
+                "dt_med_s": float(np.median(dt_u)),
+                "dt_max_s": float(np.max(dt_u)),
+                "n": int(dt_u.size),
+            })
 
         # Valid epochs are where both ephem and LOS exist
         pos_ok = E[["x_km","y_km","z_km"]].notna().all(axis=1)
@@ -441,6 +515,11 @@ def run_for_target(target_id: str):
 
         aligned[obs] = df
         _log("DEBUG", f"[JOIN] OBS {obs}: {vis_count} visible rows (full index {len(df)})")
+
+        if dt_diag_rows:
+            dt_csv = RUN_DIR / f"dt_diagnostics_{target_id}.csv"
+            pd.DataFrame(dt_diag_rows).to_csv(dt_csv, index=False)
+            _log("INFO", f"[DT  ] Salvato Δt diagnostics → {dt_csv}")
 
     if not aligned:
         raise RuntimeError("No observers aligned to OEM epochs.")
