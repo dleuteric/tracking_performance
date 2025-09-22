@@ -228,6 +228,88 @@ def step_ewrls(run_id: str):
             try:
                 tgt = tri_csv.stem.replace("xhat_geo_", "")
                 out_csv = str(out_dir / f"ewrls_tracks_{tgt}.csv")
+                # --- EWDBG: fingerprint triangulation inputs for this run ---
+                from pathlib import Path
+                import hashlib, pandas as pd, numpy as np, re
+
+                def _tgt_id(name: str) -> str:
+                    m = re.search(r"(HGV[_-]\d{5})", name, re.IGNORECASE)
+                    return m.group(1).replace("-", "_").upper() if m else Path(name).stem
+
+                def _pick(df: pd.DataFrame, cands) -> str | None:
+                    for c in cands:
+                        if c in df.columns: return c
+                    # fuzzy
+                    low = [c.lower() for c in df.columns]
+                    for pat in cands:
+                        for i, lc in enumerate(low):
+                            if pat in lc: return df.columns[i]
+                    return None
+
+                def _xyz_array(df: pd.DataFrame) -> np.ndarray:
+                    # supporta x_km / xhat_x_km / x_icrf_km / x_ecef_km / x_m ...
+                    xc = _pick(df, ["x_km", "xhat_x_km", "x_icrf_km", "x_ecef_km", "x", "x_icrf_m", "x_ecef_m", "x_m"])
+                    yc = _pick(df, ["y_km", "xhat_y_km", "y_icrf_km", "y_ecef_km", "y", "y_icrf_m", "y_ecef_m", "y_m"])
+                    zc = _pick(df, ["z_km", "xhat_z_km", "z_icrf_km", "z_ecef_km", "z", "z_icrf_m", "z_ecef_m", "z_m"])
+                    if not (xc and yc and zc):
+                        missing = {"x": xc, "y": yc, "z": zc}
+                        raise KeyError(f"Cannot map x/y/z from columns {list(df.columns)} | missing={missing}")
+
+                    # metri vs km
+                    def looks_m(col: str) -> bool:
+                        cl = col.lower()
+                        return ("_m" in cl and "_km" not in cl) or cl.endswith("meters")
+
+                    scale = 1000.0 if (looks_m(xc) or looks_m(yc) or looks_m(zc)) else 1.0
+                    arr = np.column_stack([
+                        df[xc].astype(float).to_numpy() / scale,
+                        df[yc].astype(float).to_numpy() / scale,
+                        df[zc].astype(float).to_numpy() / scale,
+                    ])
+                    return np.round(arr, 6)  # stabilizza hash
+
+                def _md5_xyz(csv_path: Path) -> tuple[str, int, float, float]:
+                    df = pd.read_csv(csv_path)
+                    arr = _xyz_array(df)
+                    h = hashlib.md5(arr.tobytes()).hexdigest()[:8]
+                    n = len(df)
+                    # time
+                    tcol = _pick(df, ["t_s", "time_s", "t", "epoch_s", "time", "epoch"])
+                    if tcol is not None:
+                        try:
+                            tt = df[tcol].astype(float).to_numpy()
+                        except Exception:
+                            tt = pd.to_datetime(df[tcol], utc=True).astype("int64").to_numpy() / 1e9
+                        t0, t1 = float(tt[0]), float(tt[-1])
+                    else:
+                        t0 = t1 = np.nan
+                    return h, n, t0, t1
+
+                tri_dir = TRI_DIR / run_id
+                xhat_files = sorted(tri_dir.glob("xhat_geo_*.csv"))  # <- fix refuso
+                _log("INFO", f"[EWDBG] tri_dir={tri_dir} | files={len(xhat_files)}")
+                sigma_file = tri_dir / "los_sigma_rad.txt"
+                try:
+                    sigma_txt = sigma_file.read_text().strip()
+                except Exception:
+                    sigma_txt = "MISSING"
+                _log("INFO", f"[EWDBG] los_sigma_rad.txt={sigma_txt}")
+
+                rows = []
+                for p in xhat_files:
+                    try:
+                        h, n, t0_, t1_ = _md5_xyz(p)
+                        tid = _tgt_id(p.name)
+                        _log("INFO", f"[EWDBG] {tid}: n={n} t=[{t0_:.1f},{t1_:.1f}] md5(xyz)={h}")
+                        rows.append({"target": tid, "n": n, "t0": t0_, "t1": t1_, "md5_xyz": h})
+                    except Exception as e:
+                        _log("WARN", f"[EWDBG] {p.name}: fingerprint skip ({e})")
+
+                dbg_dir = (TRACKS_DIR / run_id)  # mettiamo il fingerprint dove scriviamo le tracce
+                dbg_dir.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(rows).to_csv(dbg_dir / "_ew_inputs_fingerprint.csv", index=False)
+                _log("INFO", f"[EWDBG] fingerprints → {dbg_dir / '_ew_inputs_fingerprint.csv'}")
+                # --- /EWDBG ---
                 run_ewrls_on_csv(str(tri_csv), out_csv=out_csv, frame=frame, order=order, theta=theta)
                 n_ok += 1
 
