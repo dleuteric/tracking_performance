@@ -121,48 +121,103 @@ def read_oem_ccsds(path: Path) -> pd.DataFrame:
                 recs.append((t,x,y,z,vx,vy,vz))
     if not recs:
         raise RuntimeError(f"No state lines in OEM {path}")
-    df = pd.DataFrame(recs, columns=["time","x_km","y_km","z_km","vx_kmps","vy_kmps","vz_kmps"])\
-           .dropna(subset=["time"]).sort_values("time")
-    return df.set_index("time")
+    df = pd.DataFrame(recs, columns=["time", "x_km", "y_km", "z_km", "vx_kmps", "vy_kmps", "vz_kmps"])
+    s = pd.to_datetime(df["time"], errors="coerce")
+    if getattr(s.dt, "tz", None) is not None:
+        s = s.dt.tz_convert("UTC")
+    else:
+        s = s.dt.tz_localize("UTC")
+    df["time"] = s
+    df = df.dropna(subset=["time"]).sort_values("time").set_index("time")
+    return df
 
-def _norm_time_utc(df: pd.DataFrame, col: str="time") -> pd.DataFrame:
-    with pd.option_context('mode.chained_assignment', None):
-        df[col] = pd.to_datetime(df[col], utc=True, errors="coerce").dt.round("s")
-    return df.dropna(subset=[col]).sort_values(col)
+def _norm_time_utc(df: pd.DataFrame, col: str = "time") -> pd.DataFrame:
+    s = pd.to_datetime(df[col], errors="coerce")  # niente utc=True qui
+    # se è tz-aware → convert, altrimenti localize
+    if getattr(s.dt, "tz", None) is not None:
+        s = s.dt.tz_convert("UTC")
+    else:
+        s = s.dt.tz_localize("UTC")
+    s = s.dt.round("s")
+    out = df.copy()
+    out[col] = s
+    return out.dropna(subset=[col]).sort_values(col)
 
-# --------------------------
-# Interpolation helpers
-# --------------------------
+def _ensure_utc_index(idx) -> pd.DatetimeIndex:
+    """
+    Converte qualunque indice/serie temporale in DatetimeIndex UTC:
+    - Se tz-aware → tz_convert("UTC")
+    - Se naive     → tz_localize("UTC")
+    """
+    # accetta Series, DatetimeIndex o array-like
+    s = pd.to_datetime(idx, errors="coerce")
+    if isinstance(s, pd.Series):
+        if getattr(s.dt, "tz", None) is not None:
+            s = s.dt.tz_convert("UTC")
+        else:
+            s = s.dt.tz_localize("UTC")
+        return pd.DatetimeIndex(s)
+    else:
+        # DatetimeIndex
+        if getattr(s, "tz", None) is not None:
+            s = s.tz_convert("UTC")
+        else:
+            s = s.tz_localize("UTC")
+        return pd.DatetimeIndex(s)
 
 def interp_ephem_to_times(eph: pd.DataFrame, times_utc: pd.DatetimeIndex) -> pd.DataFrame:
-    if "time" in eph.columns: eph = eph.set_index("time")
+    # porta l'ephemeris su indice 'time' in UTC
+    if "time" in eph.columns:
+        eph = eph.set_index("time")
     eph = eph.sort_index()
-    t0,t1 = eph.index.min(), eph.index.max()
-    times = pd.to_datetime(times_utc, utc=True)
-    times = times[(times>=t0)&(times<=t1)]
-    if len(times)==0:
-        return pd.DataFrame(columns=["x_km","y_km","z_km"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    eph.index = _ensure_utc_index(eph.index)
+
+    # normalizza i tempi richiesti
+    times = _ensure_utc_index(times_utc)
+    # tieni solo i tempi dentro lo span dell'ephemeris
+    t0, t1 = eph.index.min(), eph.index.max()
+    times = times[(times >= t0) & (times <= t1)]
+    if len(times) == 0:
+        return pd.DataFrame(columns=["x_km", "y_km", "z_km"]).set_index(
+            pd.DatetimeIndex([], tz="UTC")
+        )
+
+    # reindex + interpolate su tempo
     e = eph.reindex(eph.index.union(times)).sort_index()
-    e = e.interpolate(method="time")[ ["x_km","y_km","z_km"] ]
+    e = e.interpolate(method="time")[["x_km", "y_km", "z_km"]]
     out = e.loc[times]
     out.index.name = "time"
     return out
 
+
 def interp_los_to_times(los: pd.DataFrame, times_utc: pd.DatetimeIndex) -> pd.DataFrame:
-    if "time" in los.columns: los = los.set_index("time")
+    # porta la LOS su indice 'time' in UTC
+    if "time" in los.columns:
+        los = los.set_index("time")
     los = los.sort_index()
-    t0,t1 = los.index.min(), los.index.max()
-    times = pd.to_datetime(times_utc, utc=True)
-    times = times[(times>=t0)&(times<=t1)]
-    if len(times)==0:
-        return pd.DataFrame(columns=["ux","uy","uz"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    los.index = _ensure_utc_index(los.index)
+
+    # normalizza i tempi richiesti
+    times = _ensure_utc_index(times_utc)
+    # tieni solo i tempi dentro lo span della LOS
+    t0, t1 = los.index.min(), los.index.max()
+    times = times[(times >= t0) & (times <= t1)]
+    if len(times) == 0:
+        return pd.DataFrame(columns=["ux", "uy", "uz"]).set_index(
+            pd.DatetimeIndex([], tz="UTC")
+        )
+
+    # reindex + interpolate su tempo
     L = los.reindex(los.index.union(times)).sort_index()
-    L = L.interpolate(method="time")[ ["ux","uy","uz"] ]
-    # normalize
+    L = L.interpolate(method="time")[["ux", "uy", "uz"]]
+
+    # rinormalizza i versori
     arr = L.to_numpy(float)
-    n = np.linalg.norm(arr, axis=1, keepdims=True); n[n==0]=1.0
-    arr = arr/n
-    L.loc[:,["ux","uy","uz"]] = arr
+    n = np.linalg.norm(arr, axis=1, keepdims=True)
+    n[n == 0] = 1.0
+    arr = arr / n
+    L.loc[:, ["ux", "uy", "uz"]] = arr
+
     out = L.loc[times]
     out.index.name = "time"
     return out
@@ -491,7 +546,14 @@ def run_for_target(target_id: str):
     if out.empty:
         _log("WARN", "[WARN] No epochs kept after Earth-occlusion gating.")
         return
-    out["time"] = pd.to_datetime(out["time"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    ts = pd.to_datetime(out["time"], errors="coerce")
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_convert("UTC")
+    else:
+        ts = ts.dt.tz_localize("UTC")
+    out["time"] = ts.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
     out_path = RUN_DIR / f"xhat_geo_{target_id}.csv"
     out.to_csv(out_path, index=False)
     _log("INFO", f"[OK ] Wrote {len(out)} epochs -> {out_path}")
