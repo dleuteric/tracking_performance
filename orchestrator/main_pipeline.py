@@ -2,7 +2,7 @@
 """
 Config-driven end-to-end orchestrator for ez-SMAD.
 
-Steps: Triangulation → Geometry plots → Estimation (EW-RLS default / legacy CV-KF)
+Steps: Triangulation → Geometry plots → Estimation (KF +/or EW-RLS)
        → Filter plots → Interactive 3D (optional)
 """
 from __future__ import annotations
@@ -51,10 +51,11 @@ FLAGS = {
     "RUN_TRIANGULATION": True,
     "RUN_GEOM_PLOTS": True,
     "RUN_FILTER_FORWARD": True,     # estimation on by default
-    "USE_EWRLS": True,              # EW-RLS replaces legacy CV-KF
+    "USE_KF": True,                 # <— NEW: run legacy CV-KF (run_filter)
+    "USE_EWRLS": True,              # EW-RLS in cascade after KF (if enabled)
     "RUN_FILTER_PLOTS": None,
     "RUN_INTERACTIVE_3D": None,
-    "REUSE_TRIANGULATION": None,
+    "REUSE_TRIANGULATION": False,
     "FORCE_RUN_ID": None,
     "CONTINUE_ON_ERROR": False,
 }
@@ -67,15 +68,16 @@ def _env_bool(name: str, default: None | bool = None) -> None | bool:
     if v in ("0","false","no","off"): return False
     return default
 
-FLAGS["RUN_TRIANGULATION"]  = _env_bool("RUN_TRI",  FLAGS["RUN_TRIANGULATION"])  if FLAGS["RUN_TRIANGULATION"]  is None else FLAGS["RUN_TRIANGULATION"]
-FLAGS["RUN_GEOM_PLOTS"]     = _env_bool("RUN_GPLT", FLAGS["RUN_GEOM_PLOTS"])     if FLAGS["RUN_GEOM_PLOTS"]     is None else FLAGS["RUN_GEOM_PLOTS"]
-FLAGS["RUN_FILTER_FORWARD"] = _env_bool("RUN_FWD",  FLAGS["RUN_FILTER_FORWARD"]) if FLAGS["RUN_FILTER_FORWARD"] is None else FLAGS["RUN_FILTER_FORWARD"]
-FLAGS["USE_EWRLS"]          = _env_bool("USE_EWRLS",FLAGS["USE_EWRLS"])          if FLAGS["USE_EWRLS"]          is None else FLAGS["USE_EWRLS"]
-FLAGS["RUN_FILTER_PLOTS"]   = _env_bool("RUN_FPLT", FLAGS["RUN_FILTER_PLOTS"])   if FLAGS["RUN_FILTER_PLOTS"]   is None else FLAGS["RUN_FILTER_PLOTS"]
-FLAGS["RUN_INTERACTIVE_3D"] = _env_bool("RUN_I3D",  FLAGS["RUN_INTERACTIVE_3D"]) if FLAGS["RUN_INTERACTIVE_3D"] is None else FLAGS["RUN_INTERACTIVE_3D"]
-FLAGS["REUSE_TRIANGULATION"]= _env_bool("REUSE_TRI",FLAGS["REUSE_TRIANGULATION"])if FLAGS["REUSE_TRIANGULATION"]is None else FLAGS["REUSE_TRIANGULATION"]
-FLAGS["CONTINUE_ON_ERROR"]  = _env_bool("CONT_ERR", FLAGS["CONTINUE_ON_ERROR"])  if FLAGS["CONTINUE_ON_ERROR"]  is None else FLAGS["CONTINUE_ON_ERROR"]
-FLAGS["FORCE_RUN_ID"]       = _env("RUN_ID", FLAGS["FORCE_RUN_ID"]) if FLAGS["FORCE_RUN_ID"] is None else FLAGS["FORCE_RUN_ID"]
+FLAGS["RUN_TRIANGULATION"]   = _env_bool("RUN_TRI",  FLAGS["RUN_TRIANGULATION"])   if FLAGS["RUN_TRIANGULATION"]   is None else FLAGS["RUN_TRIANGULATION"]
+FLAGS["RUN_GEOM_PLOTS"]      = _env_bool("RUN_GPLT", FLAGS["RUN_GEOM_PLOTS"])      if FLAGS["RUN_GEOM_PLOTS"]      is None else FLAGS["RUN_GEOM_PLOTS"]
+FLAGS["RUN_FILTER_FORWARD"]  = _env_bool("RUN_FWD",  FLAGS["RUN_FILTER_FORWARD"])  if FLAGS["RUN_FILTER_FORWARD"]  is None else FLAGS["RUN_FILTER_FORWARD"]
+FLAGS["USE_KF"]              = _env_bool("USE_KF",   FLAGS["USE_KF"])              if FLAGS["USE_KF"]              is None else FLAGS["USE_KF"]
+FLAGS["USE_EWRLS"]           = _env_bool("USE_EWRLS",FLAGS["USE_EWRLS"])           if FLAGS["USE_EWRLS"]           is None else FLAGS["USE_EWRLS"]
+FLAGS["RUN_FILTER_PLOTS"]    = _env_bool("RUN_FPLT", FLAGS["RUN_FILTER_PLOTS"])    if FLAGS["RUN_FILTER_PLOTS"]    is None else FLAGS["RUN_FILTER_PLOTS"]
+FLAGS["RUN_INTERACTIVE_3D"]  = _env_bool("RUN_I3D",  FLAGS["RUN_INTERACTIVE_3D"])  if FLAGS["RUN_INTERACTIVE_3D"]  is None else FLAGS["RUN_INTERACTIVE_3D"]
+FLAGS["REUSE_TRIANGULATION"] = _env_bool("REUSE_TRI",FLAGS["REUSE_TRIANGULATION"]) if FLAGS["REUSE_TRIANGULATION"] is None else FLAGS["REUSE_TRIANGULATION"]
+FLAGS["CONTINUE_ON_ERROR"]   = _env_bool("CONT_ERR", FLAGS["CONTINUE_ON_ERROR"])   if FLAGS["CONTINUE_ON_ERROR"]   is None else FLAGS["CONTINUE_ON_ERROR"]
+FLAGS["FORCE_RUN_ID"]        = _env("RUN_ID", FLAGS["FORCE_RUN_ID"]) if FLAGS["FORCE_RUN_ID"] is None else FLAGS["FORCE_RUN_ID"]
 
 # --------------- Helpers ---------------
 def _ensure_pkg_path():
@@ -156,18 +158,19 @@ def step_geom_plots(run_id: str):
         raise
 
 def step_filter_forward(run_id: str):
+    """Legacy CV-KF pipeline (run_filter)."""
     _ensure_pkg_path(); os.environ["RUN_ID"] = run_id
     try:
         import estimationandfiltering.run_filter as rfil
-        _log("INFO", "[STEP] Filtering (forward) starting...", _get_run_metadata(run_id))
+        _log("INFO", "[STEP] KF (legacy) filtering starting...", _get_run_metadata(run_id))
         t0 = datetime.now(); rfil.main()
-        _log("INFO", f"[STEP] Filtering (forward) ✓ completed in {(datetime.now()-t0).total_seconds():.1f}s")
+        _log("INFO", f"[STEP] KF filtering ✓ completed in {(datetime.now()-t0).total_seconds():.1f}s")
         return True
     except Exception as e:
-        _log("ERROR", f"[ERR ] Filtering forward failed: {e}")
+        _log("ERROR", f"[ERR ] KF filtering failed: {e}")
         traceback.print_exc()
         if FLAGS["CONTINUE_ON_ERROR"]:
-            _log("WARN", "[CONT] Continuing despite filter error")
+            _log("WARN", "[CONT] Continuing despite KF error")
             return False
         raise
 
@@ -200,7 +203,7 @@ def step_interactive_3d(run_id: str):
         return False
 
 def step_ewrls(run_id: str):
-    """Run EW-RLS on ALL triangulated xhat_geo_*.csv for this run."""
+    """Run EW-RLS on ALL triangulated xhat_geo_*.csv for this run (writes tracks + compatibility files)."""
     _ensure_pkg_path(); os.environ["RUN_ID"] = run_id
     try:
         from estimationandfiltering.ew_rls import run_ewrls_on_csv
@@ -227,33 +230,28 @@ def step_ewrls(run_id: str):
                 out_csv = str(out_dir / f"ewrls_tracks_{tgt}.csv")
                 run_ewrls_on_csv(str(tri_csv), out_csv=out_csv, frame=frame, order=order, theta=theta)
                 n_ok += 1
-                # Write compatibility file expected by plots: *_track_icrf_forward.csv
+
+                # Write compatibility file expected by some plotters: *_track_icrf_forward.csv
                 comp_csv = out_dir / f"{tgt}_track_icrf_forward.csv"
                 try:
                     df_out = pd.read_csv(out_csv)
-                    # Ensure 'time' column exists (ISO8601 UTC) for plots expecting it
                     if "time" not in df_out.columns and "t_s" in df_out.columns:
                         try:
                             df_out["time"] = pd.to_datetime(df_out["t_s"], unit="s", utc=True).dt.strftime(
                                 "%Y-%m-%dT%H:%M:%S.%fZ")
                         except Exception:
                             pass
-                    # If columns are generic (x_km, vx_kms), provide ICRF-aliases for plotting
-                    rename_map = {
-                        "x_km": "x_icrf_km", "y_km": "y_icrf_km", "z_km": "z_icrf_km",
-                        "vx_kms": "vx_icrf_kms", "vy_kms": "vy_icrf_kms", "vz_kms": "vz_icrf_kms",
-                    }
-                    # Only rename if target columns are absent
-                    for src, dst in list(rename_map.items()):
+                    # duplicate aliases for ICRF columns if missing
+                    for src, dst in {
+                        "x_km":"x_icrf_km","y_km":"y_icrf_km","z_km":"z_icrf_km",
+                        "vx_kms":"vx_icrf_kms","vy_kms":"vy_icrf_kms","vz_kms":"vz_icrf_kms",
+                    }.items():
                         if src in df_out.columns and dst not in df_out.columns:
                             df_out[dst] = df_out[src]
-                    # Ensure time column is named as plots expect
                     if "t_s" not in df_out.columns:
-                        # try common fallbacks
                         for c in ("time_s","t","time","epoch_s","epoch"):
                             if c in df_out.columns:
                                 df_out["t_s"] = df_out[c]; break
-                    # Mark frame for clarity (do not transform coords here)
                     if "frame" not in df_out.columns:
                         df_out["frame"] = frame
                     df_out.to_csv(comp_csv, index=False)
@@ -285,18 +283,23 @@ def main():
 
     _validate_directories()
 
-    run_tri = FLAGS["RUN_TRIANGULATION"]  if FLAGS["RUN_TRIANGULATION"]  is not None else bool(CFG.get("orchestrator", {}).get("run_triangulation", True))
-    run_gplt= FLAGS["RUN_GEOM_PLOTS"]     if FLAGS["RUN_GEOM_PLOTS"]     is not None else bool(CFG.get("orchestrator", {}).get("run_geom_plots", True))
-    run_fwd = FLAGS["RUN_FILTER_FORWARD"] if FLAGS["RUN_FILTER_FORWARD"] is not None else bool(CFG.get("orchestrator", {}).get("run_filter_forward", False))
-    run_fplt= FLAGS["RUN_FILTER_PLOTS"]   if FLAGS["RUN_FILTER_PLOTS"]   is not None else bool(CFG.get("orchestrator", {}).get("run_filter_plots", False))
-    run_i3d = FLAGS["RUN_INTERACTIVE_3D"] if FLAGS["RUN_INTERACTIVE_3D"] is not None else bool(CFG.get("orchestrator", {}).get("run_interactive_3d", False))
-    reuse_tri = FLAGS["REUSE_TRIANGULATION"] if FLAGS["REUSE_TRIANGULATION"] is not None else True
+    run_tri = FLAGS["RUN_TRIANGULATION"]   if FLAGS["RUN_TRIANGULATION"]   is not None else bool(CFG.get("orchestrator", {}).get("run_triangulation", True))
+    run_gplt= FLAGS["RUN_GEOM_PLOTS"]      if FLAGS["RUN_GEOM_PLOTS"]      is not None else bool(CFG.get("orchestrator", {}).get("run_geom_plots", True))
+    run_fwd = FLAGS["RUN_FILTER_FORWARD"]  if FLAGS["RUN_FILTER_FORWARD"]  is not None else bool(CFG.get("orchestrator", {}).get("run_filter_forward", True))
+    run_fplt= FLAGS["RUN_FILTER_PLOTS"]    if FLAGS["RUN_FILTER_PLOTS"]    is not None else bool(CFG.get("orchestrator", {}).get("run_filter_plots", True))
+    run_i3d = FLAGS["RUN_INTERACTIVE_3D"]  if FLAGS["RUN_INTERACTIVE_3D"]  is not None else bool(CFG.get("orchestrator", {}).get("run_interactive_3d", False))
+    reuse_tri = FLAGS["REUSE_TRIANGULATION"] if FLAGS["REUSE_TRIANGULATION"] is not None else False
+
+    use_kf = bool(FLAGS.get("USE_KF", True))
+    use_ew = bool(FLAGS.get("USE_EWRLS", True))
+
+    _log("INFO", f"Flags: reuse_tri={reuse_tri} | use_kf={use_kf} | use_ewrls={use_ew}")
 
     _log("INFO", "Pipeline Configuration:")
     _log("INFO", f"  • Triangulation    : {'RUN' if run_tri else 'SKIP/REUSE'}")
     _log("INFO", f"  • Geometry Plots   : {'RUN' if run_gplt else 'SKIP'}")
-    _log("INFO", f"  • Filter Forward   : {'RUN' if run_fwd else 'SKIP'}")
-    _log("INFO", f"  • Use EW-RLS       : {'YES' if FLAGS['USE_EWRLS'] else 'NO'}")
+    _log("INFO", f"  • Estimation (KF)  : {'ON'  if (run_fwd and FLAGS['USE_KF']) else 'OFF'}")
+    _log("INFO", f"  • Estimation (EW)  : {'ON'  if (run_fwd and FLAGS['USE_EWRLS']) else 'OFF'}")
     _log("INFO", f"  • Filter Plots     : {'RUN' if run_fplt else 'SKIP'}")
     _log("INFO", f"  • Interactive 3D   : {'RUN' if run_i3d else 'SKIP'}")
     _log("INFO", f"  • Continue on Error: {'YES' if FLAGS['CONTINUE_ON_ERROR'] else 'NO'}")
@@ -312,6 +315,24 @@ def main():
 
     completed = []
 
+    # --- STEP 1: read + log σ_LOS from config (aligned to YAML) ---
+    gpm_cfg = CFG.get("gpm_measurement", {}) or {}
+    geom_cfg = CFG.get("geometry", {}) or {}
+
+    # Primary: gpm_measurement.los_noise_rad  (this is how it's named in pipeline.yaml)
+    if "los_noise_rad" in gpm_cfg:
+        los_sigma = float(gpm_cfg["los_noise_rad"])
+    # Fallback: geometry.los_sigma (if someone sets it there)
+    elif "los_sigma" in geom_cfg:
+        los_sigma = float(geom_cfg["los_sigma"])
+    else:
+        _log("ERROR", "[CFG ] Missing σ_LOS: expected 'gpm_measurement.los_noise_rad' (rad) "
+                      "or fallback 'geometry.los_sigma' (rad).")
+        raise KeyError("los_sigma")
+
+    _log("INFO", f"[CFG ] σ_LOS = {los_sigma:.6e} rad (source: "
+                 f"{'gpm_measurement.los_noise_rad' if 'los_noise_rad' in gpm_cfg else 'geometry.los_sigma'})")
+
     # 1) Triangulation or reuse
     if run_tri:
         if step_triangulation():
@@ -319,11 +340,19 @@ def main():
         run_id = _latest_run_id(TRI_DIR)
         os.environ["RUN_ID"] = run_id
         _log("INFO", f"[RUN ] Using RUN_ID: {run_id}")
+        # save los_sigma for this run
+        run_root = TRI_DIR / run_id
+        (run_root / "los_sigma_rad.txt").write_text(f"{los_sigma:.9e}\n")
+
     else:
         if reuse_tri:
             run_id = _resolve_reusable_run_id(run_id)
             os.environ["RUN_ID"] = run_id
             _log("INFO", f"[RUN ] Reusing triangulation RUN_ID: {run_id}")
+            # save los_sigma also in reuse case
+            run_root = TRI_DIR / run_id
+            (run_root / "los_sigma_rad.txt").write_text(f"{los_sigma:.9e}\n")
+
         else:
             if not run_id:
                 raise RuntimeError("RUN_ID undefined and reuse disabled; set RUN_ID or enable triangulation.")
@@ -331,19 +360,24 @@ def main():
                 raise FileNotFoundError(f"Triangulation RUN_ID has no CSVs: {TRI_DIR / run_id}")
             os.environ["RUN_ID"] = run_id
             _log("INFO", f"[RUN ] Using pre-set RUN_ID: {run_id}")
+            # save los_sigma also in preset case
+            run_root = TRI_DIR / run_id
+            (run_root / "los_sigma_rad.txt").write_text(f"{los_sigma:.9e}\n")
 
     # 2) Geometry plots
     if run_gplt and step_geom_plots(run_id):
         completed.append("geom_plots")
 
-    # 3) Estimation
+    # 3) Estimation (cascade: KF then EW if enabled)
     if run_fwd:
+        # KF first (legacy CV-KF pipeline)
+        if FLAGS["USE_KF"]:
+            if step_filter_forward(run_id):
+                completed.append("kf_forward")
+        # EW-RLS next
         if FLAGS["USE_EWRLS"]:
             if step_ewrls(run_id):
                 completed.append("ewrls_forward")
-        else:
-            if step_filter_forward(run_id):
-                completed.append("filter_forward")
 
     # 4) Filter plots
     if run_fplt and step_filter_plots(run_id):
@@ -361,7 +395,7 @@ def main():
     _log("INFO", f"       RUN_ID: {run_id}")
     _log("INFO", f"       Triangulation: {TRI_DIR / run_id}")
     if "geom_plots" in completed: _log("INFO", f"       Geom plots   : {PLOTS_GEOM_DIR / run_id}")
-    if ("filter_forward" in completed) or ("ewrls_forward" in completed):
+    if ("kf_forward" in completed) or ("ewrls_forward" in completed):
         _log("INFO", f"       Tracks       : {TRACKS_DIR / run_id}")
     if ("filter_plots" in completed) or ("interactive_3d" in completed):
         _log("INFO", f"       Filter plots : {PLOTS_FILT_DIR / run_id}")
