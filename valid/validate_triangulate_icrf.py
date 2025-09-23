@@ -77,11 +77,35 @@ def _read_sigma_from_run(run_dir: Path) -> Optional[float]:
     return None
 
 def _discover_latest_runs(tri_root: Path, n: int = 2) -> List[Path]:
+    """Return the latest N *valid* run directories under tri_root.
+    A valid run dir is a directory that:
+      - does not start with an underscore (e.g. "_old")
+      - contains at least one file matching "xhat_geo_*.csv" directly inside it.
+    """
     if not tri_root.exists():
         raise FileNotFoundError(f"Triangulation root not found: {tri_root}")
-    runs = [p for p in tri_root.iterdir() if p.is_dir()]
-    runs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return runs[:n]
+
+    def is_valid_run(p: Path) -> bool:
+        if not p.is_dir():
+            return False
+        if p.name.startswith("_"):
+            return False
+        # must have at least one triangulation CSV at top level
+        return any(p.glob("xhat_geo_*.csv"))
+
+    candidates = [p for p in tri_root.iterdir() if is_valid_run(p)]
+    if not candidates:
+        # Provide a helpful hint of what's there
+        names = ", ".join(sorted([p.name for p in tri_root.iterdir() if p.is_dir()]))
+        raise RuntimeError(
+            "No valid triangulation runs found. "
+            f"Looked in: {tri_root}. Subdirs: [{names}]\n"
+            "A run dir must contain at least one 'xhat_geo_*.csv'. "
+            "Try specifying --runs or --run_ids explicitly."
+        )
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[:n]
 
 def _discover_targets_in_run(run_dir: Path) -> List[str]:
     return sorted([p.stem.split("xhat_geo_")[-1] for p in run_dir.glob("xhat_geo_*.csv")])
@@ -286,13 +310,20 @@ def main():
     else:
         run_dirs = _discover_latest_runs(tri_root, n=max(2, int(args.latest)))
 
-    # Build RunInfo
+    # Build RunInfo (skip empty/invalid run dirs defensively)
     runs: List[RunInfo] = []
     for rd in run_dirs:
         if not rd.exists():
-            raise FileNotFoundError(f"Run dir not found: {rd}")
+            print(f"[WARN] Run dir not found: {rd}")
+            continue
+        if not any(rd.glob("xhat_geo_*.csv")):
+            print(f"[WARN] No xhat_geo_*.csv in {rd} — skipping")
+            continue
         sigma = _read_sigma_from_run(rd)
         runs.append(RunInfo(path=rd, name=rd.name, sigma_los_rad=float(sigma) if sigma is not None else np.nan))
+
+    if not runs:
+        raise RuntimeError("No usable run directories left after filtering. Aborting.")
 
     # Determine targets
     if args.targets:
@@ -302,8 +333,11 @@ def main():
         for r in runs:
             ts = set(_discover_targets_in_run(r.path))
             if not ts:
-                raise RuntimeError(f"No xhat_geo_*.csv files in {r.path}")
+                print(f"[WARN] No xhat_geo_*.csv files in {r.path} — skipping this run for target intersection")
+                continue
             sets.append(ts)
+        if not sets:
+            raise RuntimeError("Could not determine targets — no runs with triangulation CSVs found.")
         targets = sorted(list(set.intersection(*sets))) if len(sets) >= 2 else sorted(list(sets[0]))
         if not targets:
             raise RuntimeError("No common targets across runs; pass --targets explicitly.")
