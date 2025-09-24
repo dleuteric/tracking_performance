@@ -1,0 +1,2 @@
+run,target,sigma_los_rad,sigma_los_urad,rmse_x_km,rmse_y_km,rmse_z_km,rmse_norm_km,median_CEP50_km,median_Nsats,median_beta_mean_deg,median_condA,n_epochs
+20250923T161531Z_0sats_0km_0deg_7f267fdf,HGV_00001,0.00055,550.0,3.743317810427466e-12,2.80764938626828e-12,2.250695502067448e-12,5.192393816834656e-12,0.9403933692852189,6.0,,2.15015192305323,1458

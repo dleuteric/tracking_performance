@@ -1,0 +1,79 @@
+project:
+  root: auto
+  run_id: null
+  timezone: UTC
+paths:
+  exports_root: exports
+  stk_exports: exports/stk_exports
+  los_root: exports/geometry/los
+  ephem_root: '{stk_exports}/OUTPUT_EPHEM'
+  oem_root: exports/target_exports/OUTPUT_OEM
+  target_csv: exports/target_exports/OUTPUT_CSV
+  triangulation_out: exports/triangulation
+  tracks_out: exports/tracks
+  geom_plots_out: plots
+  filter_plots_out: plots_filter
+  cache_dir: .cache
+run_id:
+  template: '{date}Z_{nsats}sats_{alt_km}km_{inc_deg}deg_{hash}'
+  date_format: '%Y%m%dT%H%M%S'
+  fields_from_ephem_headers: true
+  fallback:
+    nsats: 0
+    alt_km: 0
+    inc_deg: 0
+triangulation:
+  selection:
+    mode: best_pair
+    beta_cap_deg: 120
+    min_beta_deg: 20
+    prefer_cross_plane: true
+    same_plane_penalty_deg: 10
+    use_elev_weight: true
+    min_nsats_epoch: 2
+geometry:
+  frame: ICRF
+  earth_radius_km: 6378.137
+  occlusion_margin_km: 0.0
+  min_observers: 2
+  beta_pairs_mode: all
+  beta_summary_k: 10
+  resample_hz: 1
+  interp_method: linear
+  max_time_gap_s: 5
+gpm_measurement:
+  los_noise_rad: 0.00045
+  cep_method: analytic
+  write_pair_metrics: true
+filter:
+  P0_diag:
+  - 25.0
+  - 25.0
+  - 25.0
+  - 0.25
+  - 0.25
+  - 0.25
+  - 0.01
+  - 0.01
+  - 0.01
+  jerk_psd_km2_s5: 3.0e-05
+  chi2_gate_3dof: 1.0e9
+  inflate:
+    bad_geom_factor: 1.0
+    condA_thresh: 1.0e99
+    condA_factor: 1.0
+    betamin_thresh_deg: 0.0
+    betamin_factor: 1.0
+plotting:
+  dpi: 160
+  make_interactive_html: true
+  style: default
+orchestrator:
+  run_triangulation: true
+  run_geom_plots: true
+  run_filter_forward: true
+  run_filter_plots: true
+  run_interactive_3d: true
+  max_epochs: null
+logging:
+  level: INFO

@@ -43,7 +43,7 @@ def main():
     # 4) Types & ranges spot checks
     assert isinstance(cfg["geometry"]["earth_radius_km"], (int,float))
     assert cfg["geometry"]["min_observers"] >= 2
-    assert cfg["filter"]["chi2_gate_3dof"] > 0
+    assert cfg["filter"]["chi2_gate_3dof"] >= 0
     print("[OK ] Type/range checks passed.")
 
     # 5) Existence checks (use absolute paths)

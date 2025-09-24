@@ -8,6 +8,7 @@ Steps: Triangulation → Geometry plots → Estimation (KF +/or EW-RLS)
 from __future__ import annotations
 
 import os, sys, json, traceback
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -22,18 +23,16 @@ except Exception:
         sys.path.insert(0, str(pkg_root))
     from config.loader import load_config
 
-CFG = load_config()
-PROJECT_ROOT = Path(CFG["project"]["root"]).resolve()
-
-# Paths
-_paths = CFG["paths"]
-TRI_DIR        = (PROJECT_ROOT / _paths["triangulation_out"]).resolve()
-PLOTS_GEOM_DIR = (PROJECT_ROOT / _paths["geom_plots_out"]).resolve()
-TRACKS_DIR     = (PROJECT_ROOT / _paths["tracks_out"]).resolve()
-PLOTS_FILT_DIR = (PROJECT_ROOT / _paths["filter_plots_out"]).resolve()
+# --------------- Config globals (populated in main) ---------------
+CFG = None
+PROJECT_ROOT = None
+TRI_DIR = None
+PLOTS_GEOM_DIR = None
+TRACKS_DIR = None
+PLOTS_FILT_DIR = None
 
 # --------------- Logging ---------------
-LOG_LEVEL = str(CFG.get("logging", {}).get("level", "INFO")).upper()
+LOG_LEVEL = "INFO"
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
 
 def _log(level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
@@ -124,11 +123,31 @@ def _get_run_metadata(run_id: str) -> Dict[str, Any]:
 
 # --------------- Steps ---------------
 def step_triangulation():
+    global CFG
     _ensure_pkg_path()
     _log("DEBUG", f"sys.path[0:3]={sys.path[0:3]}")
     try:
         import geometry.triangulate_icrf as tri
         _log("INFO", "[STEP] Triangulation starting...")
+        # Log LOS and EPH sources explicitly
+        los_root = None
+        eph_root = None
+        try:
+            los_root = CFG["paths"].get("los_root")
+        except Exception:
+            pass
+        try:
+            eph_root = CFG["paths"].get("ephem_root")
+        except Exception:
+            pass
+        if los_root is not None:
+            _log("INFO", f"[CFG ] LOS source : {los_root}")
+        else:
+            _log("INFO", "[CFG ] LOS source : (default STK location)")
+        if eph_root is not None:
+            _log("INFO", f"[CFG ] EPH source : {eph_root}")
+        else:
+            _log("INFO", "[CFG ] EPH source : (default STK location)")
         t0 = datetime.now()
         tri.main()
         _log("INFO", f"[STEP] Triangulation ✓ completed in {(datetime.now()-t0).total_seconds():.1f}s")
@@ -203,160 +222,77 @@ def step_interactive_3d(run_id: str):
         return False
 
 def step_ewrls(run_id: str):
-    """Run EW-RLS on ALL triangulated xhat_geo_*.csv for this run (writes tracks + compatibility files)."""
+    """Run EW-RLS (ICRF) using ewrls_icrf_tracks.py on all triangulated targets for this run."""
     _ensure_pkg_path(); os.environ["RUN_ID"] = run_id
     try:
-        from estimationandfiltering.ew_rls import run_ewrls_on_csv
-        import pandas as pd
-        _log("INFO", "[STEP] EW-RLS estimation starting...", _get_run_metadata(run_id))
+        import estimationandfiltering.ewrls_icrf_tracks as ewmod
+        _log("INFO", "[STEP] EW-RLS (ICRF) starting...", _get_run_metadata(run_id))
         t0 = datetime.now()
-
-        tri_dir = TRI_DIR / run_id
-        tri_list = sorted(tri_dir.glob("xhat_geo_*.csv"))
-        if not tri_list:
-            raise FileNotFoundError(f"No triangulation CSVs in {tri_dir}")
-
-        out_dir = (TRACKS_DIR / run_id)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        frame = str(CFG.get("frames", {}).get("triangulation_frame", "ECEF"))
-        theta = float(CFG.get("estimation", {}).get("ewrls_theta", 0.93))
-        order = int(CFG.get("estimation", {}).get("ewrls_order", 4))
-
-        n_ok, n_fail = 0, 0
-        for tri_csv in tri_list:
-            try:
-                tgt = tri_csv.stem.replace("xhat_geo_", "")
-                out_csv = str(out_dir / f"ewrls_tracks_{tgt}.csv")
-                # --- EWDBG: fingerprint triangulation inputs for this run ---
-                from pathlib import Path
-                import hashlib, pandas as pd, numpy as np, re
-
-                def _tgt_id(name: str) -> str:
-                    m = re.search(r"(HGV[_-]\d{5})", name, re.IGNORECASE)
-                    return m.group(1).replace("-", "_").upper() if m else Path(name).stem
-
-                def _pick(df: pd.DataFrame, cands) -> str | None:
-                    for c in cands:
-                        if c in df.columns: return c
-                    # fuzzy
-                    low = [c.lower() for c in df.columns]
-                    for pat in cands:
-                        for i, lc in enumerate(low):
-                            if pat in lc: return df.columns[i]
-                    return None
-
-                def _xyz_array(df: pd.DataFrame) -> np.ndarray:
-                    # supporta x_km / xhat_x_km / x_icrf_km / x_ecef_km / x_m ...
-                    xc = _pick(df, ["x_km", "xhat_x_km", "x_icrf_km", "x_ecef_km", "x", "x_icrf_m", "x_ecef_m", "x_m"])
-                    yc = _pick(df, ["y_km", "xhat_y_km", "y_icrf_km", "y_ecef_km", "y", "y_icrf_m", "y_ecef_m", "y_m"])
-                    zc = _pick(df, ["z_km", "xhat_z_km", "z_icrf_km", "z_ecef_km", "z", "z_icrf_m", "z_ecef_m", "z_m"])
-                    if not (xc and yc and zc):
-                        missing = {"x": xc, "y": yc, "z": zc}
-                        raise KeyError(f"Cannot map x/y/z from columns {list(df.columns)} | missing={missing}")
-
-                    # metri vs km
-                    def looks_m(col: str) -> bool:
-                        cl = col.lower()
-                        return ("_m" in cl and "_km" not in cl) or cl.endswith("meters")
-
-                    scale = 1000.0 if (looks_m(xc) or looks_m(yc) or looks_m(zc)) else 1.0
-                    arr = np.column_stack([
-                        df[xc].astype(float).to_numpy() / scale,
-                        df[yc].astype(float).to_numpy() / scale,
-                        df[zc].astype(float).to_numpy() / scale,
-                    ])
-                    return np.round(arr, 6)  # stabilizza hash
-
-                def _md5_xyz(csv_path: Path) -> tuple[str, int, float, float]:
-                    df = pd.read_csv(csv_path)
-                    arr = _xyz_array(df)
-                    h = hashlib.md5(arr.tobytes()).hexdigest()[:8]
-                    n = len(df)
-                    # time
-                    tcol = _pick(df, ["t_s", "time_s", "t", "epoch_s", "time", "epoch"])
-                    if tcol is not None:
-                        try:
-                            tt = df[tcol].astype(float).to_numpy()
-                        except Exception:
-                            tt = pd.to_datetime(df[tcol], utc=True).astype("int64").to_numpy() / 1e9
-                        t0, t1 = float(tt[0]), float(tt[-1])
-                    else:
-                        t0 = t1 = np.nan
-                    return h, n, t0, t1
-
-                tri_dir = TRI_DIR / run_id
-                xhat_files = sorted(tri_dir.glob("xhat_geo_*.csv"))  # <- fix refuso
-                _log("INFO", f"[EWDBG] tri_dir={tri_dir} | files={len(xhat_files)}")
-                sigma_file = tri_dir / "los_sigma_rad.txt"
-                try:
-                    sigma_txt = sigma_file.read_text().strip()
-                except Exception:
-                    sigma_txt = "MISSING"
-                _log("INFO", f"[EWDBG] los_sigma_rad.txt={sigma_txt}")
-
-                rows = []
-                for p in xhat_files:
-                    try:
-                        h, n, t0_, t1_ = _md5_xyz(p)
-                        tid = _tgt_id(p.name)
-                        _log("INFO", f"[EWDBG] {tid}: n={n} t=[{t0_:.1f},{t1_:.1f}] md5(xyz)={h}")
-                        rows.append({"target": tid, "n": n, "t0": t0_, "t1": t1_, "md5_xyz": h})
-                    except Exception as e:
-                        _log("WARN", f"[EWDBG] {p.name}: fingerprint skip ({e})")
-
-                dbg_dir = (TRACKS_DIR / run_id)  # mettiamo il fingerprint dove scriviamo le tracce
-                dbg_dir.mkdir(parents=True, exist_ok=True)
-                pd.DataFrame(rows).to_csv(dbg_dir / "_ew_inputs_fingerprint.csv", index=False)
-                _log("INFO", f"[EWDBG] fingerprints → {dbg_dir / '_ew_inputs_fingerprint.csv'}")
-                # --- /EWDBG ---
-                run_ewrls_on_csv(str(tri_csv), out_csv=out_csv, frame=frame, order=order, theta=theta)
-                n_ok += 1
-
-                # Write compatibility file expected by some plotters: *_track_icrf_forward.csv
-                comp_csv = out_dir / f"{tgt}_track_icrf_forward.csv"
-                try:
-                    df_out = pd.read_csv(out_csv)
-                    if "time" not in df_out.columns and "t_s" in df_out.columns:
-                        try:
-                            df_out["time"] = pd.to_datetime(df_out["t_s"], unit="s", utc=True).dt.strftime(
-                                "%Y-%m-%dT%H:%M:%S.%fZ")
-                        except Exception:
-                            pass
-                    # duplicate aliases for ICRF columns if missing
-                    for src, dst in {
-                        "x_km":"x_icrf_km","y_km":"y_icrf_km","z_km":"z_icrf_km",
-                        "vx_kms":"vx_icrf_kms","vy_kms":"vy_icrf_kms","vz_kms":"vz_icrf_kms",
-                    }.items():
-                        if src in df_out.columns and dst not in df_out.columns:
-                            df_out[dst] = df_out[src]
-                    if "t_s" not in df_out.columns:
-                        for c in ("time_s","t","time","epoch_s","epoch"):
-                            if c in df_out.columns:
-                                df_out["t_s"] = df_out[c]; break
-                    if "frame" not in df_out.columns:
-                        df_out["frame"] = frame
-                    df_out.to_csv(comp_csv, index=False)
-                except Exception as ce:
-                    _log("WARN", f"[EW-RLS] Could not write compatibility file {comp_csv.name}: {ce}")
-            except Exception as fe:
-                n_fail += 1
-                _log("ERROR", f"[EW-RLS] Failed on {tri_csv.name}: {fe}")
-                if not FLAGS["CONTINUE_ON_ERROR"]:
-                    raise
-
-        _log("INFO", f"[STEP] EW-RLS ✓ wrote {n_ok} file(s), {n_fail} failed, in {(datetime.now()-t0).total_seconds():.1f}s → {out_dir}")
-        return n_ok > 0
+        # ewrls_icrf_tracks.run() discovers RUN_ID from env if needed
+        ewmod.run()
+        _log("INFO", f"[STEP] EW-RLS (ICRF) ✓ completed in {(datetime.now()-t0).total_seconds():.1f}s")
+        return True
     except Exception as e:
-        _log("ERROR", f"[ERR ] EW-RLS failed: {e}")
+        _log("ERROR", f"[ERR ] EW-RLS (ICRF) failed: {e}")
         traceback.print_exc()
         if FLAGS["CONTINUE_ON_ERROR"]:
             _log("WARN", "[CONT] Continuing despite EW-RLS error")
             return False
         raise
 
+
+# --- New: Comparator step ---
+def step_compare(run_id: str, config_path: str | None):
+    """Run the new comparator to align KF vs EW-RLS vs truth and export metrics/plots."""
+    _ensure_pkg_path(); os.environ["RUN_ID"] = run_id
+    try:
+        comp_py = PROJECT_ROOT / "estimationandfiltering" / "comparator_new.py"
+        if not comp_py.exists():
+            raise FileNotFoundError(f"Missing comparator: {comp_py}")
+        _log("INFO", "[STEP] Comparator starting...", _get_run_metadata(run_id))
+        t0 = datetime.now()
+        cmd = [sys.executable, str(comp_py), "--run_id", run_id, "--out_dir", PLOTS_FILT_DIR
+               ]
+        if config_path:
+            cmd.extend(["--config", str(config_path)])
+        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), text=True, capture_output=True)
+        if proc.returncode != 0:
+            _log("ERROR", f"[ERR ] Comparator stderr:\n{proc.stderr}")
+            _log("ERROR", f"[ERR ] Comparator stdout:\n{proc.stdout}")
+            raise RuntimeError("Comparator failed")
+        _log("INFO", f"[STEP] Comparator ✓ completed in {(datetime.now()-t0).total_seconds():.1f}s")
+        return True
+    except Exception as e:
+        _log("ERROR", f"[ERR ] Comparator failed: {e}")
+        traceback.print_exc()
+        if FLAGS["CONTINUE_ON_ERROR"]:
+            _log("WARN", "[CONT] Continuing despite comparator error")
+            return False
+        raise
+
 # --------------- Main ---------------
-def main():
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="ez-SMAD main pipeline")
+    parser.add_argument("--config", type=str, default=None, help="YAML config file path")
+    return parser.parse_args()
+
+def main(config_path: str | None = None):
+    global CFG, PROJECT_ROOT, TRI_DIR, PLOTS_GEOM_DIR, TRACKS_DIR, PLOTS_FILT_DIR, LOG_LEVEL
+    # 1. Load config (from param, env, or default)
+    if config_path is None:
+        config_path = os.environ.get("PIPELINE_CFG")
+    CFG = load_config(config_path)
+    # 2. Set up paths from config
+    PROJECT_ROOT = Path(CFG["project"]["root"]).resolve()
+    _paths = CFG["paths"]
+    TRI_DIR        = (PROJECT_ROOT / _paths["triangulation_out"]).resolve()
+    PLOTS_GEOM_DIR = (PROJECT_ROOT / _paths["geom_plots_out"]).resolve()
+    TRACKS_DIR     = (PROJECT_ROOT / _paths["tracks_out"]).resolve()
+    PLOTS_FILT_DIR = (PROJECT_ROOT / _paths["filter_plots_out"]).resolve()
+    LOG_LEVEL = str(CFG.get("logging", {}).get("level", "INFO")).upper()
+
     start = datetime.now()
     _log("INFO", "=" * 60)
     _log("INFO", "PWSA Tracking Layer Pipeline Starting")
@@ -425,7 +361,15 @@ def main():
         # save los_sigma for this run
         run_root = TRI_DIR / run_id
         (run_root / "los_sigma_rad.txt").write_text(f"{los_sigma:.9e}\n")
-
+        # Write manifest json
+        manifest = {
+            "los_sigma_rad": los_sigma,
+            "los_source": CFG["paths"].get("los_root"),
+            "eph_source": CFG["paths"].get("ephem_root"),
+            "config_file": config_path if config_path is not None else "(default loader)"
+        }
+        with open(run_root / "run_config_manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
     else:
         if reuse_tri:
             run_id = _resolve_reusable_run_id(run_id)
@@ -434,7 +378,15 @@ def main():
             # save los_sigma also in reuse case
             run_root = TRI_DIR / run_id
             (run_root / "los_sigma_rad.txt").write_text(f"{los_sigma:.9e}\n")
-
+            # Write manifest json
+            manifest = {
+                "los_sigma_rad": los_sigma,
+                "los_source": CFG["paths"].get("los_root"),
+                "eph_source": CFG["paths"].get("ephem_root"),
+                "config_file": config_path if config_path is not None else "(default loader)"
+            }
+            with open(run_root / "run_config_manifest.json", "w") as f:
+                json.dump(manifest, f, indent=2)
         else:
             if not run_id:
                 raise RuntimeError("RUN_ID undefined and reuse disabled; set RUN_ID or enable triangulation.")
@@ -445,27 +397,40 @@ def main():
             # save los_sigma also in preset case
             run_root = TRI_DIR / run_id
             (run_root / "los_sigma_rad.txt").write_text(f"{los_sigma:.9e}\n")
+            # Write manifest json
+            manifest = {
+                "los_sigma_rad": los_sigma,
+                "los_source": CFG["paths"].get("los_root"),
+                "eph_source": CFG["paths"].get("ephem_root"),
+                "config_file": config_path if config_path is not None else "(default loader)"
+            }
+            with open(run_root / "run_config_manifest.json", "w") as f:
+                json.dump(manifest, f, indent=2)
 
-    # 2) Geometry plots
-    if run_gplt and step_geom_plots(run_id):
-        completed.append("geom_plots")
+    completed = completed  # keep list
 
-    # 3) Estimation (cascade: KF then EW if enabled)
+    # 2) Estimation in cascade: KF → EW-RLS
     if run_fwd:
-        # KF first (legacy CV-KF pipeline)
         if FLAGS["USE_KF"]:
             if step_filter_forward(run_id):
                 completed.append("kf_forward")
-        # EW-RLS next
         if FLAGS["USE_EWRLS"]:
             if step_ewrls(run_id):
                 completed.append("ewrls_forward")
 
-    # 4) Filter plots
+    # 3) Comparator (align KF vs EW-RLS vs Truth; export metrics/overlay)
+    if step_compare(run_id, config_path):
+        completed.append("compare")
+
+    # 4) Geometry plots (optional – after having all products)
+    if run_gplt and step_geom_plots(run_id):
+        completed.append("geom_plots")
+
+    # 5) Filter plots (optional)
     if run_fplt and step_filter_plots(run_id):
         completed.append("filter_plots")
 
-    # 5) Interactive 3D
+    # 6) Interactive 3D (optional)
     if run_i3d and step_interactive_3d(run_id):
         completed.append("interactive_3d")
 
@@ -485,7 +450,8 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        args = parse_args()
+        main(config_path=args.config)
     except KeyboardInterrupt:
         _log("WARN", "\n[ABORT] Pipeline interrupted by user")
         sys.exit(1)

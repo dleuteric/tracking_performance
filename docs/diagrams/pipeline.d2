@@ -1,0 +1,110 @@
+title: "ez-SMAD • High-level modules & I/O"
+
+# Global styling
+style: {
+  stroke: "#555555"
+  stroke-width: 2
+  font-size: 12
+}
+
+# Component styling for rectangles
+*.style: {
+  fill: "#F9F9F9"
+  stroke: "#444444"
+  border-radius: 10
+}
+
+# Components
+Config: {
+  label: "Configuration File"
+  shape: rectangle
+}
+
+Scene: {
+  label: "Scene Generation Module"
+  Threat: "Threat Simulation"
+  Background: "Background Model"
+}
+
+Space: {
+  label: "Space Segment Module"
+  Constellation: "Constellation Model"
+  Sensors: "Sensors Model"
+}
+
+MGM: {
+  label: "Mission Geometry Module"
+  shape: rectangle
+}
+
+GPM: {
+  label: "Geometric Performance Module"
+  shape: rectangle
+}
+
+RPM: {
+  label: "Radiometric Performance Module"
+  shape: rectangle
+}
+
+EFM: {
+  label: "Estimation & Filtering Module"
+  shape: rectangle
+}
+
+Sys: {
+  label: "System Performance Analysis Module"
+  Processing: "Processing Chain Model"
+  Tracking: "Tracking Performance Module"
+}
+
+Mission: {
+  label: "Mission Analysis Module"
+  General: "General Mission Analysis"
+  Comm: "Comm Architecture Perf"
+}
+
+HUB: {
+  label: "LOS/Range Hub"
+  shape: circle
+  style: {
+    fill: "#FFFFFF"
+    stroke: "#444444"
+  }
+}
+
+# Configuration flows (dotted lines)
+Config -> Space.Constellation: {
+  label: "Space Segment Config"
+  style: {
+    stroke-dash: 5
+  }
+}
+Config -> Space.Sensors: {
+  label: "Sensors Config"
+  style: {
+    stroke-dash: 5
+  }
+}
+Config -> Scene.Threat: {
+  label: "Raid Config"
+  style: {
+    stroke-dash: 5
+  }
+}
+
+# Main data flows
+Scene.Threat -> MGM: "Target ECI/ECEF"
+Space.Constellation -> MGM: "Observers ECI/ECEF"
+Space.Constellation -> MGM: "Sun/Moon"
+MGM -> HUB
+HUB -> GPM: `los.csv, access.csv\nβ, GDOP`
+HUB -> Scene.Background: "los.csv (sensor→target)"
+HUB -> RPM: "los.csv, Range"
+Scene.Background -> RPM: `background radiance\nEarth/Sun/Moon, τ(λ)`
+Scene.Threat -> RPM: "threat signature"
+Space.Sensors -> RPM: "EO/detector params"
+GPM -> EFM: "meas.csv (az,el,range) + R_k"
+RPM -> Sys: "SNR, P_d, FAR"
+EFM -> Sys: "tracks.csv, P_k, CEP, RMSE"
+Sys -> Mission: `KPI summary (coverage, persistence,\ntracking availability, latency)`

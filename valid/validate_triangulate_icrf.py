@@ -70,11 +70,29 @@ def _read_sigma_from_run(run_dir: Path) -> Optional[float]:
             return float(f.read_text().strip())
         except Exception:
             pass
+    # Fallback #2: read from manifest.txt (line like 'sigma_los_rad=...')
+    mf = run_dir / "manifest.txt"
+    if mf.exists():
+        try:
+            for line in mf.read_text().splitlines():
+                if line.strip().lower().startswith("sigma_los_rad="):
+                    return float(line.split("=", 1)[1].strip())
+        except Exception:
+            pass
     # Fallback: parse “…_<N>urad” in directory name
     m = re.search(r"(\d+(?:\.\d+)?)\s*urad", run_dir.name, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 1e-6
     return None
+# Helper: robust median for series-like input
+def _safe_median(series_like) -> float:
+    try:
+        arr = pd.to_numeric(pd.Series(series_like), errors="coerce").to_numpy(float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.median(arr)) if arr.size else float("nan")
+    except Exception:
+        return float("nan")
+
 
 def _discover_latest_runs(tri_root: Path, n: int = 2) -> List[Path]:
     """Return the latest N *valid* run directories under tri_root.
@@ -181,8 +199,9 @@ def compute_metrics_for_run_target(run: RunInfo, target_id: str, oem_dir: Path) 
         # fuzzy match
         low = [c.lower() for c in df.columns]
         for pat in cands:
-            for i,lc in enumerate(low):
-                if pat in lc: return df.columns[i]
+            for i, lc in enumerate(low):
+                if pat in lc:
+                    return df.columns[i]
         raise KeyError(f"Missing {cands} in triangulation file")
 
     xcol = pick(xh, ["xhat_x_km","x_km","x_icrf_km"])
@@ -203,10 +222,10 @@ def compute_metrics_for_run_target(run: RunInfo, target_id: str, oem_dir: Path) 
     finite = np.isfinite(en)
     rmse_xyz = _rmse(np.vstack([ex,ey,ez])[:, finite], axis=1)
     rmse_norm = float(_rmse(en[finite]))
-    med_cep = float(np.nanmedian(joined.get("CEP50_km_analytic", pd.Series(np.nan, index=joined.index)).to_numpy(float)))
-    med_nsat= float(np.nanmedian(joined.get("Nsats", pd.Series(np.nan, index=joined.index)).to_numpy(float)))
-    med_beta= float(np.nanmedian(joined.get("beta_mean_deg", pd.Series(np.nan, index=joined.index)).to_numpy(float)))
-    med_cond= float(np.nanmedian(joined.get("condA", pd.Series(np.nan, index=joined.index)).to_numpy(float)))
+    med_cep  = _safe_median(joined.get("CEP50_km_analytic", pd.Series(np.nan, index=joined.index)))
+    med_nsat = _safe_median(joined.get("Nsats", pd.Series(np.nan, index=joined.index)))
+    med_beta = _safe_median(joined.get("beta_mean_deg", pd.Series(np.nan, index=joined.index)))
+    med_cond = _safe_median(joined.get("condA", pd.Series(np.nan, index=joined.index)))
 
     m = {
         "run": run.name,
@@ -227,13 +246,17 @@ def compute_metrics_for_run_target(run: RunInfo, target_id: str, oem_dir: Path) 
 
 def plot_time_series_errnorm(per_run_joined: Dict[str,pd.DataFrame], target_id: str, outdir: Path):
     plt.figure(figsize=(10, 4.5))
+    plotted = False
     for run_name, df in per_run_joined.items():
-        plt.plot(df.index.to_pydatetime(), df["err_norm_km"].to_numpy(float), label=run_name)
+        if not df.empty and "err_norm_km" in df.columns:
+            plt.plot(df.index.to_pydatetime(), df["err_norm_km"].to_numpy(float), label=run_name)
+            plotted = True
     plt.title(f"Error norm vs time — {target_id}")
     plt.xlabel("UTC time")
     plt.ylabel("|x̂ − x_true| [km]")
     plt.grid(True, alpha=0.3)
-    plt.legend(frameon=False)
+    if plotted:
+        plt.legend(frameon=False)
     fn = outdir / f"time_series_errnorm_{target_id}.png"
     plt.tight_layout(); plt.savefig(fn, dpi=150); plt.close()
 
@@ -264,17 +287,21 @@ def plot_scatter_vs_sigma(metrics_df: pd.DataFrame, outdir: Path):
 
 def plot_cep_vs_beta(per_run_joined: Dict[str,pd.DataFrame], target_id: str, outdir: Path):
     plt.figure(figsize=(6.5, 4.5))
+    plotted = False
     for run_name, df in per_run_joined.items():
         if "beta_mean_deg" in df.columns and "CEP50_km_analytic" in df.columns:
             b = df["beta_mean_deg"].to_numpy(float)
             c = df["CEP50_km_analytic"].to_numpy(float)
             mask = np.isfinite(b) & np.isfinite(c)
-            plt.scatter(b[mask], c[mask], s=10, alpha=0.45, label=run_name)
+            if mask.any():
+                plt.scatter(b[mask], c[mask], s=10, alpha=0.45, label=run_name)
+                plotted = True
     plt.title(f"CEP50 vs baseline angle — {target_id}")
     plt.xlabel("β_mean [deg]")
     plt.ylabel("CEP50_analytic [km]")
     plt.grid(True, alpha=0.3)
-    plt.legend(frameon=False)
+    if plotted:
+        plt.legend(frameon=False)
     fn = outdir / f"cep_vs_beta_{target_id}.png"
     plt.tight_layout(); plt.savefig(fn, dpi=150); plt.close()
 

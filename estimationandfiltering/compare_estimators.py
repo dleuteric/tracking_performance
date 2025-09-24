@@ -1,4 +1,3 @@
-# estimationandfiltering/compare_estimators.py — clean rewrite
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -55,7 +54,7 @@ def read_oem_icrf(oem_path: Path) -> Dict[str, Any]:
                 if s.startswith("REF_FRAME"):
                     ref = s.split("=")[-1].strip()
                 continue
-            if s[0].isdigit() and "T" in s:
+            if s and s[0].isdigit() and "T" in s:
                 parts = s.split()
                 if len(parts) >= 7:
                     times.append(parts[0])
@@ -99,7 +98,7 @@ def read_estimator_csv(csv_path: Path) -> pd.DataFrame:
         t_s = t.astype(float).to_numpy()
     except Exception:
         t_s = pd.to_datetime(t, utc=True, errors="coerce")
-        if t_s.isna().any():
+        if getattr(t_s, "isna", lambda: False)().any():
             t_s = pd.to_datetime(t, errors="coerce")
         t_s = t_s.astype("int64").to_numpy() / 1e9
 

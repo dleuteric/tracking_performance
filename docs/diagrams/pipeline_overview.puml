@@ -1,0 +1,102 @@
+@startuml
+top to bottom direction
+' ====== Layout & stile ======
+skinparam linetype ortho
+skinparam ArrowColor #555
+skinparam ArrowThickness 1.3
+skinparam ArrowFontSize 12
+skinparam nodesep 60
+skinparam ranksep 80
+skinparam rectangle {
+  BackgroundColor #f9f9f9
+  BorderColor #444
+  RoundCorner 10
+}
+title ez-SMAD • High-level modules & I/O
+
+
+
+
+
+' ====== Blocchi ======
+rectangle "Configuration File" as Config
+
+rectangle "Scene Generation Module" as Scene {
+  [Threat Simulation]
+  [Background Model]
+}
+
+rectangle "Space Segment Module" as Space {
+  [Constellation Model]
+  [Sensors Model]
+}
+
+rectangle "Mission Geometry Module" as MGM
+rectangle "Geometric Performance Module" as GPM
+rectangle "Radiometric Performance Module" as RPM
+rectangle "Estimation & Filtering Module" as EFM
+
+rectangle "System Performance Analysis Module" as Sys {
+  [Processing Chain Model]
+  [Tracking Performance Module]
+}
+
+rectangle "Mission Analysis Module" as Mission {
+  [General Mission Analysis]
+  [Comm Architecture Perf]
+}
+
+
+
+' ====== Config (puntinato) ======
+Config .. [Constellation Model] : Space Segment Config
+Config .. [Sensors Model]       : Sensors Config
+Config .. [Threat Simulation]   : Raid Config
+
+' ====== Flussi principali (con hub per decongestionare) ======
+[Threat Simulation]  -right-> MGM : Target ECI/ECEF
+[Constellation Model] -right-> MGM : Observers ECI/ECEF
+[Constellation Model] -down->  MGM : Sun/Moon
+
+' Hub centrale per i prodotti di Geometry
+() "LOS/Range Hub" as HUB
+
+MGM -right-> HUB
+
+' Verso Geometric Performance
+HUB -right-> GPM
+note on link
+  los.csv, access.csv
+  β, GDOP
+end note
+
+' Verso Background
+HUB -down-> [Background Model]
+note on link
+  los.csv (sensor→target)
+end note
+
+' Verso Radiometric
+HUB -down-> RPM
+note on link
+  los.csv, Range
+end note
+
+[Background Model] -right-> RPM
+note on link
+  background radiance
+  Earth/Sun/Moon, τ(λ)
+end note
+
+[Threat Simulation] -down-> RPM : threat signature
+[Sensors Model]     -down-> RPM : EO/detector params
+
+GPM -right-> EFM
+note on link
+  meas.csv (az,el,range) + R_k
+end note
+
+RPM -down->  Sys : SNR, P_d, FAR
+EFM -right-> Sys : tracks.csv, P_k, CEP, RMSE
+Sys -right-> Mission : KPI summary (coverage, persistence,\ntracking availability, latency)
+@enduml

@@ -42,6 +42,29 @@ R_EARTH_KM   = float(CFG["geometry"]["earth_radius_km"])  # km
 N_OBS_MIN    = int(CFG["geometry"]["min_observers"])      # >= 2
 SIGMA_LOS    = float(CFG["gpm_measurement"]["los_noise_rad"])  # rad
 
+# reproducible noise for LOS perturbations used in triangulation
+NOISE_SEED   = int(CFG.get("geometry", {}).get("los_noise_seed", 12345))
+_rng = np.random.default_rng(NOISE_SEED)
+
+def _perturb_los(u: np.ndarray, sigma_rad: float) -> np.ndarray:
+    """
+    Apply a small random rotation to unit vector u with std dev sigma_rad (radians).
+    The rotation axis is random and orthogonal to u.
+    """
+    if sigma_rad <= 0:
+        return u
+    v = _rng.normal(size=3)
+    v = v - (v @ u) * u
+    n = np.linalg.norm(v)
+    if n == 0:
+        return u
+    w = v / n  # unit orthogonal direction
+    # rotate u by angle alpha around axis w (in plane span{u,w})
+    alpha = _rng.normal(scale=sigma_rad)
+    u_rot = (np.cos(alpha) * u) + (np.sin(alpha) * w)
+    # ensure unit length
+    return u_rot / np.linalg.norm(u_rot)
+
 # --------------------------
 # Simple log
 # --------------------------
@@ -252,6 +275,11 @@ def run_for_target(target_id: str) -> None:
             rs.append(r); us.append(u); ids.append(oid)
         if len(us) < N_OBS_MIN:
             continue
+
+        # --- Inject angular noise on LOS before solving (simulates measurement error) ---
+        us = [_perturb_los(u, SIGMA_LOS) for u in us]
+
+        # solve with noisy LOS
         xhat, condA = triangulate_epoch(rs, us)
         # enforce directions (towards solution)
         fixed = []
