@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import yaml
+import json
 
 # --- Project paths ---
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,5 +127,123 @@ def ecef_to_icrf_xyz(x_km: np.ndarray, y_km: np.ndarray, z_km: np.ndarray, t_s: 
     return np.einsum('nij,nj->ni', R, r)
 
 
+# =========================
+# Ephemerides loader (space_segment outputs)
+# =========================
+def _ephem_root_candidates() -> List[Path]:
+    """Return likely ephemeris root candidates, most specific first."""
+    return [
+        ROOT / "exports" / "ephemeris",
+        ROOT / "flightdynamics" / "exports" / "ephemeris",
+    ]
 
+def find_ephemeris_root() -> Path:
+    """Locate the ephemeris root containing at least one valid run (with manifest)."""
+    for root in _ephem_root_candidates():
+        if root.exists() and root.is_dir():
+            try:
+                for d in root.iterdir():
+                    if d.is_dir():
+                        man = d / f"manifest_{d.name}.json"
+                        if man.exists():
+                            return root
+            except Exception:
+                continue
+    raise FileNotFoundError("Ephemeris root not found. Expected exports/ephemeris/<RUN_ID>/manifest_<RUN_ID>.json")
 
+def list_ephemeris_runs(ephem_root: Optional[Path] = None) -> List[Path]:
+    """List available run directories (sorted)."""
+    base = ephem_root or find_ephemeris_root()
+    runs = [p for p in base.iterdir() if p.is_dir() and (p / f"manifest_{p.name}.json").exists()]
+    return sorted(runs)
+
+def latest_ephemeris_run(ephem_root: Optional[Path] = None) -> Path:
+    runs = list_ephemeris_runs(ephem_root)
+    if not runs:
+        raise FileNotFoundError("No ephemeris runs found.")
+    return runs[-1]
+
+def load_space_segment_manifest(run_dir: Path) -> Dict[str, Any]:
+    """Read the manifest_<RUN_ID>.json inside a run directory."""
+    run_dir = Path(run_dir)
+    man = run_dir / f"manifest_{run_dir.name}.json"
+    if not man.exists():
+        raise FileNotFoundError(f"Manifest not found: {man}")
+    with man.open("r") as f:
+        return json.load(f)
+
+def load_space_segment_ephemerides(
+    run_dir: Optional[Path] = None,
+    *,
+    sat_ids: Optional[List[str]] = None,
+    regime: Optional[str] = None,
+    frame: str = "ECEF",
+    parse_time: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Load satellite ephemerides exported by flightdynamics/space_segment.py.
+    Returns a dict keyed by satellite key (e.g., 'P1_S3'), values are DataFrames with columns:
+      ['t_sec','epoch_utc','x_km','y_km','z_km','vx_km_s','vy_km_s','vz_km_s','regime']
+    If frame=='ICRF', additional columns ['x_icrf_km','y_icrf_km','z_icrf_km'] are added (positions only).
+    Filters:
+      - sat_ids: list of keys to include (e.g., ['P1_S1','P1_S2']).
+      - regime: 'LEO'|'MEO'|'GEO'|'HEO' (case-insensitive), matched from filename prefix.
+    """
+    # Resolve run directory
+    if run_dir is None:
+        run_dir = latest_ephemeris_run()
+    run_dir = Path(run_dir)
+    manifest = load_space_segment_manifest(run_dir)
+    files_map: Dict[str, str] = manifest.get("files", {})
+
+    out: Dict[str, pd.DataFrame] = {}
+    regime_u = regime.upper() if regime else None
+
+    for key, rel in files_map.items():
+        # Filter by sat id
+        if sat_ids is not None and key not in sat_ids:
+            continue
+        # Filter by regime
+        reg = Path(rel).name.split("_", 1)[0].upper() if "_" in Path(rel).name else "UNK"
+        if regime_u and reg != regime_u:
+            continue
+
+        csv_path = run_dir / rel
+        if not csv_path.exists():
+            continue
+
+        df = pd.read_csv(csv_path)
+        # Ensure expected columns exist
+        req = {"t_sec","epoch_utc","x_km","y_km","z_km","vx_km_s","vy_km_s","vz_km_s"}
+        missing = req - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing columns in {csv_path.name}: {sorted(missing)}")
+
+        # Parse times
+        if parse_time:
+            try:
+                dt = pd.to_datetime(df["epoch_utc"], utc=True, errors="coerce")
+                df["epoch_dt"] = dt
+                df["t_unix_s"] = dt.view("int64") / 1e9
+            except Exception:
+                pass
+
+        # Attach regime
+        df["regime"] = reg
+
+        # Optional ICRF position columns
+        if frame.upper() == "ICRF":
+            if "t_unix_s" not in df.columns:
+                dt = pd.to_datetime(df["epoch_utc"], utc=True, errors="coerce")
+                df["t_unix_s"] = dt.view("int64") / 1e9
+            xeci, yeci, zeci = ecef_to_icrf_xyz(df["x_km"].to_numpy(),
+                                                 df["y_km"].to_numpy(),
+                                                 df["z_km"].to_numpy(),
+                                                 df["t_unix_s"].to_numpy()).T
+            df["x_icrf_km"] = xeci
+            df["y_icrf_km"] = yeci
+            df["z_icrf_km"] = zeci
+
+        out[key] = df
+
+    return out
