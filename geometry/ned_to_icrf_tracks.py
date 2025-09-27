@@ -1,242 +1,244 @@
 #!/usr/bin/env python3
 """
-NED to ICRF converter for ez-SMAD
-Direct conversion to match legacy CSV format
+NED/Generic CSV -> ECEF (legacy columns) for ez-SMAD
+- First line must encode NED origin: 'NED, lat_deg, lon_deg[, h0_m]'
+- Columns mapped to legacy: t_s, x_m, y_m, z_m, vx_mps, vy_mps, vz_mps
+  where x_m,y_m,z_m are ECEF [m] (not local!)
 """
 
+from __future__ import annotations
+import re
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import sys
 from pathlib import Path
 
-# Constants
-EARTH_RADIUS = 6371000  # meters
+# WGS-84
+A = 6378137.0
+F = 1.0 / 298.257223563
+E2 = F * (2.0 - F)
+EARTH_RADIUS_MEAN = 6371000.0  # for sphere plot only
 
-
-def ned_to_icrf(ned_file):
-    """
-    Convert NED CSV to ICRF format matching legacy structure
-
-    Args:
-        ned_file: Path to NED CSV file
-
-    Returns:
-        DataFrame in legacy format (t_s, x_m, y_m, z_m, vx_mps, vy_mps, vz_mps)
-    """
-
-    print(f"Reading file: {ned_file}")
-
-    # Robustly detect header line to skip and delimiter
-    with open(ned_file, 'r', encoding='utf-8', errors='ignore') as fh:
-        first_line = fh.readline().strip()
-        second_line = fh.readline().strip()
-
-    # Skip first line if it looks like a mode tag (e.g., 'NED' or 'NED;')
-    skiprows = 1 if first_line.upper().startswith('NED') else 0
-
-    # Heuristic delimiter detection from the (first non-skipped) header line
-    header_line = second_line if skiprows == 1 else first_line
+def _sniff_header_and_sep(path: str):
+    with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+        l1 = fh.readline().strip()
+        l2 = fh.readline().strip()
+    # detect sep on first non-NED line
+    header_line = l2 if l1.upper().startswith('NED') else l1
     counts = {',': header_line.count(','), ';': header_line.count(';'), '\t': header_line.count('\t')}
     sep = max(counts, key=counts.get)
     if counts[sep] == 0:
-        # Fallback to pandas sniffing
         sep = None
+    skip = 1 if l1.upper().startswith('NED') else 0
+    return l1, skip, sep
 
-    df = pd.read_csv(ned_file, sep=sep, engine='python', skiprows=skiprows)
+def _parse_ned_origin(l1: str):
+    # Extract floats from the first line (works for comma/semicolon/tab)
+    nums = [float(x) for x in re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', l1)]
+    if len(nums) < 2:
+        raise ValueError("First line must be like 'NED, lat_deg, lon_deg[, h0_m]'.")
+    lat0_deg, lon0_deg = nums[0], nums[1]
+    h0_m = nums[2] if len(nums) >= 3 else None
+    return np.deg2rad(lat0_deg), np.deg2rad(lon0_deg), h0_m
 
-    print(f"Loaded {len(df)} points")
-    print(f"Columns found: {list(df.columns)}")
+def _ecef_from_geodetic(lat, lon, h):
+    sinφ, cosφ = np.sin(lat), np.cos(lat)
+    N = A / np.sqrt(1.0 - E2 * sinφ**2)
+    x = (N + h) * cosφ * np.cos(lon)
+    y = (N + h) * cosφ * np.sin(lon)
+    z = (N * (1.0 - E2) + h) * sinφ
+    return np.array([x, y, z])
 
-    # If pandas failed to split columns (single wide column), force comma retry
+def _enu_basis_ecef(lat, lon):
+    # Columns are unit vectors of ENU in ECEF coords
+    sinφ, cosφ = np.sin(lat), np.cos(lat)
+    sinλ, cosλ = np.sin(lon), np.cos(lon)
+    e_E = np.array([-sinλ,            cosλ,           0.0      ])
+    e_N = np.array([-sinφ*cosλ,      -sinφ*sinλ,      cosφ     ])
+    e_U = np.array([ cosφ*cosλ,       cosφ*sinλ,      sinφ     ])
+    R = np.column_stack((e_E, e_N, e_U))  # E,N,U as columns
+    return R  # ECEF = R @ [E,N,U]
+
+def _read_df(path: str, sep, skip):
+    df = pd.read_csv(path, sep=sep, engine='python', skiprows=skip)
     if len(df.columns) == 1:
-        df = pd.read_csv(ned_file, sep=',', engine='python', skiprows=skiprows)
-        print("Re-read with comma separator due to single-column parse.")
-        print(f"Columns found (retry): {list(df.columns)}")
+        # retry with comma
+        df = pd.read_csv(path, sep=',', engine='python', skiprows=skip)
+    return df
 
-    # Map columns to standard names (case-insensitive)
-    col_mapping = {}
-    for col in df.columns:
-        col_lower = col.lower().strip()
-        if col_lower in ('t', 'time', 'time_s', 'timestamp') or (col_lower.startswith('t') and 's' not in col_lower and 'v' not in col_lower and 'a' not in col_lower):
-            col_mapping[col] = 't_s'
-        elif 'x' in col_lower and 'v' not in col_lower and 'a' not in col_lower:
-            col_mapping[col] = 'x_m'
-        elif 'y' in col_lower and 'v' not in col_lower and 'a' not in col_lower:
-            col_mapping[col] = 'y_m'
-        elif 'z' in col_lower and 'v' not in col_lower and 'a' not in col_lower:
-            col_mapping[col] = 'z_m'
-        elif 'vx' in col_lower:
-            col_mapping[col] = 'vx_mps'
-        elif 'vy' in col_lower:
-            col_mapping[col] = 'vy_mps'
-        elif 'vz' in col_lower:
-            col_mapping[col] = 'vz_mps'
+def _map_columns(df: pd.DataFrame):
+    colmap = {}
+    for c in df.columns:
+        cl = str(c).strip()
+        l = cl.lower()
+        if l in ('t','time','time_s','timestamp') or (l.startswith('t') and 'v' not in l and 'a' not in l and l!='tx'):
+            colmap[c] = 't_s'
+        elif l in ('x','north','n'):
+            colmap[c] = 'X'  # local North [m]
+        elif l in ('y','east','e'):
+            colmap[c] = 'Y'  # local East [m]
+        elif l in ('z','down','d'):
+            colmap[c] = 'Z'  # local Down [m] (positive down)
+        elif l in ('vx','vn','v_n','north_rate'):
+            colmap[c] = 'Vx'  # local North rate [m/s]
+        elif l in ('vy','ve','v_e','east_rate'):
+            colmap[c] = 'Vy'  # local East rate [m/s]
+        elif l in ('vz','vd','v_d','down_rate'):
+            colmap[c] = 'Vz'  # local Down rate [m/s]
+        elif l in ('altitude','alt','h'):
+            colmap[c] = 'Altitude'  # absolute height above ellipsoid [m]
+        else:
+            # keep as is (e.g., Ax,Ay,Az…)
+            colmap[c] = cl
+    dfr = df.rename(columns=colmap)
+    # coerce numeric where relevant
+    for k in ('t_s','X','Y','Z','Vx','Vy','Vz','Altitude'):
+        if k in dfr.columns:
+            dfr[k] = pd.to_numeric(dfr[k], errors='coerce')
+    return dfr
 
-    # Rename columns
-    df_renamed = df.rename(columns=col_mapping)
+def ned_csv_to_ecef_legacy(csv_path: str, out_dir: Path):
+    print("="*60)
+    print("NED/Generic -> ECEF Converter (legacy columns)")
+    print("="*60)
 
-    # Coerce known numeric columns to numeric (errors->NaN), then fill NaNs with 0
-    for c in ['t_s', 'x_m', 'y_m', 'z_m', 'vx_mps', 'vy_mps', 'vz_mps', 'Altitude']:
-        if c in df_renamed.columns:
-            df_renamed[c] = pd.to_numeric(df_renamed[c], errors='coerce')
+    l1, skip, sep = _sniff_header_and_sep(csv_path)
+    lat0, lon0, h0_opt = _parse_ned_origin(l1)
 
-    # Handle NED Z coordinate (positive down) and altitude if present
-    if 'Altitude' in df.columns and 'z_m' not in df_renamed.columns:
-        # Use altitude as negative Z (since altitude is up, Z in NED is down)
-        df_renamed['z_m'] = -df['Altitude'].values
-    elif 'z_m' in df_renamed.columns:
-        # Invert Z if it's NED (positive down -> negative for up)
-        df_renamed['z_m'] = -df_renamed['z_m'].values
+    df_raw = _read_df(csv_path, sep, skip)
+    print(f"Loaded {len(df_raw)} rows. Columns: {list(df_raw.columns)}")
 
-    # Add Earth radius to get geocentric coordinates
-    # Assuming the trajectory starts near Earth surface
-    if 'x_m' in df_renamed.columns:
-        df_renamed['x_m'] = df_renamed['x_m'].values + EARTH_RADIUS
+    df = _map_columns(df_raw)
 
-    # Invert Z velocity if from NED
-    if 'vz_mps' in df_renamed.columns:
-        df_renamed['vz_mps'] = -df_renamed['vz_mps'].values
+    # Decide h0
+    if h0_opt is not None:
+        h0 = float(h0_opt)
+    elif 'Altitude' in df.columns and pd.notna(df['Altitude'].iloc[0]):
+        h0 = float(df['Altitude'].iloc[0])
+    else:
+        h0 = 0.0
+    print(f"Origin geodetic: lat={np.rad2deg(lat0):.6f} deg, lon={np.rad2deg(lon0):.6f} deg, h0={h0:.2f} m")
 
-    # Extract only required columns in correct order
-    required_cols = ['t_s', 'x_m', 'y_m', 'z_m', 'vx_mps', 'vy_mps', 'vz_mps']
-    available_cols = [col for col in required_cols if col in df_renamed.columns]
+    # Build origin ECEF and ENU basis
+    r0_ecef = _ecef_from_geodetic(lat0, lon0, h0)
+    R_ENU2ECEF = _enu_basis_ecef(lat0, lon0)
 
-    output_df = df_renamed[available_cols].copy()
+    # Build local ENU offsets
+    # E=Y, N=X, U from Altitude (absolute) if present, else U = -Z (Down positive)
+    E = df['Y'] if 'Y' in df.columns else pd.Series(np.zeros(len(df)))
+    N = df['X'] if 'X' in df.columns else pd.Series(np.zeros(len(df)))
+    if 'Altitude' in df.columns:
+        U = df['Altitude'] - h0
+    elif 'Z' in df.columns:
+        U = -df['Z']
+    else:
+        U = pd.Series(np.zeros(len(df)))
 
-    # Fill missing columns with zeros if needed
-    for col in required_cols:
-        if col not in output_df.columns:
-            output_df[col] = 0.0
+    # Stack ENU and transform to ECEF
+    ENU = np.vstack([E.values, N.values, U.values])  # shape (3, N)
+    ECEF = (R_ENU2ECEF @ ENU) + r0_ecef.reshape(3,1)
+    x_m, y_m, z_m = ECEF[0,:], ECEF[1,:], ECEF[2,:]
 
-    # Ensure correct order
-    output_df = output_df[required_cols]
+    # Velocities (local NED -> ENU -> ECEF). Ignore transport terms.
+    if all(k in df.columns for k in ('Vx','Vy','Vz')):
+        # NED rates: Vx=Ndot, Vy=Edot, Vz=Ddot
+        # ENU rates: [Edot, Ndot, Udot] with Udot = -Ddot
+        ENUdot = np.vstack([df['Vy'].values,
+                            df['Vx'].values,
+                           -df['Vz'].values])
+        ECEFdot = R_ENU2ECEF @ ENUdot
+        vx_mps, vy_mps, vz_mps = ECEFdot[0,:], ECEFdot[1,:], ECEFdot[2,:]
+    else:
+        vx_mps = np.zeros_like(x_m)
+        vy_mps = np.zeros_like(y_m)
+        vz_mps = np.zeros_like(z_m)
 
-    return output_df
+    # Time
+    t_s = pd.to_numeric(df['t_s'], errors='coerce').fillna(0.0) if 't_s' in df.columns else pd.Series(np.arange(len(x_m), dtype=float))
 
+    # Output dataframe in legacy order (ECEF)
+    out = pd.DataFrame({
+        't_s': t_s.values,
+        'x_m': x_m,
+        'y_m': y_m,
+        'z_m': z_m,
+        'vx_mps': vx_mps,
+        'vy_mps': vy_mps,
+        'vz_mps': vz_mps,
+    })
 
-def plot_3d_trajectory(df, title="Trajectory"):
-    """
-    Create 3D plot with Earth sphere and trajectory
-    """
-    fig = plt.figure(figsize=(12, 10))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(csv_path).stem
+    out_file = out_dir / f"{stem}_ecef.csv"
+    out.to_csv(out_file, index=False)
+    print(f"✓ Saved legacy ECEF CSV: {out_file}")
+
+    # Plot quicklook
+    _plot_quicklook(out, lat0, lon0, h0, title=f"{stem} (ECEF)")
+
+    return out_file
+
+def _plot_quicklook(df_legacy: pd.DataFrame, lat0, lon0, h0, title="Trajectory"):
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    fig = plt.figure(figsize=(11, 9))
     ax = fig.add_subplot(111, projection='3d')
 
-    # Plot Earth as sphere
-    u = np.linspace(0, 2 * np.pi, 30)
-    v = np.linspace(0, np.pi, 30)
-    x_earth = EARTH_RADIUS * np.outer(np.cos(u), np.sin(v)) / 1000  # km
-    y_earth = EARTH_RADIUS * np.outer(np.sin(u), np.sin(v)) / 1000
-    z_earth = EARTH_RADIUS * np.outer(np.ones(np.size(u)), np.cos(v)) / 1000
+    # Earth sphere (for context)
+    u = np.linspace(0, 2*np.pi, 40)
+    v = np.linspace(0, np.pi, 40)
+    xs = EARTH_RADIUS_MEAN * np.outer(np.cos(u), np.sin(v)) / 1000.0
+    ys = EARTH_RADIUS_MEAN * np.outer(np.sin(u), np.sin(v)) / 1000.0
+    zs = EARTH_RADIUS_MEAN * np.outer(np.ones_like(u), np.cos(v)) / 1000.0
+    ax.plot_surface(xs, ys, zs, alpha=0.35, linewidth=0, shade=True)
 
-    ax.plot_surface(x_earth, y_earth, z_earth, color='lightblue', alpha=0.4,
-                    linewidth=0, antialiased=True)
+    x = df_legacy['x_m'] / 1000.0
+    y = df_legacy['y_m'] / 1000.0
+    z = df_legacy['z_m'] / 1000.0
+    t = pd.to_numeric(df_legacy['t_s'], errors='coerce').fillna(0.0)
 
-    # Plot trajectory
-    x = df['x_m'] / 1000  # Convert to km
-    y = df['y_m'] / 1000
-    z = df['z_m'] / 1000
+    ax.plot(x, y, z, '-', linewidth=2, label='Trajectory')
+    ax.scatter(x.iloc[0], y.iloc[0], z.iloc[0], s=60, marker='o', label='Start')
+    ax.scatter(x.iloc[-1], y.iloc[-1], z.iloc[-1], s=80, marker='*', label='End')
 
-    # Color by time (ensure numeric)
-    times = pd.to_numeric(df['t_s'], errors='coerce').fillna(0.0)
-    trajectory = ax.plot(x, y, z, 'r-', linewidth=2, label='Trajectory')
+    ax.set_xlabel('X [km]')
+    ax.set_ylabel('Y [km]')
+    ax.set_zlabel('Z [km]')
+    ax.set_title(title)
+    ax.legend()
 
-    # Plot start and end points
-    ax.scatter(x.iloc[0], y.iloc[0], z.iloc[0], color='green', s=200,
-               marker='o', label='Start', edgecolors='black', linewidth=2)
-    ax.scatter(x.iloc[-1], y.iloc[-1], z.iloc[-1], color='red', s=200,
-               marker='*', label='End', edgecolors='black', linewidth=2)
-
-    # Labels and formatting
-    ax.set_xlabel('X [km]', fontsize=12)
-    ax.set_ylabel('Y [km]', fontsize=12)
-    ax.set_zlabel('Z [km]', fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight='bold')
-
-    # Calculate proper view limits
-    trajectory_center = [x.mean(), y.mean(), z.mean()]
-    trajectory_range = max(x.max() - x.min(), y.max() - y.min(), z.max() - z.min())
-
-    plot_range = max(trajectory_range * 0.6, EARTH_RADIUS / 1000 * 1.2)
-
-    ax.set_xlim([trajectory_center[0] - plot_range, trajectory_center[0] + plot_range])
-    ax.set_ylim([trajectory_center[1] - plot_range, trajectory_center[1] + plot_range])
-    ax.set_zlim([trajectory_center[2] - plot_range, trajectory_center[2] + plot_range])
-
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-
-    # Add trajectory stats
-    altitude = np.sqrt(x ** 2 + y ** 2 + z ** 2) - EARTH_RADIUS / 1000
-    ground_range = np.sqrt((x.iloc[-1] - x.iloc[0]) ** 2 + (y.iloc[-1] - y.iloc[0]) ** 2)
-
-    stats_text = f"Max Altitude: {altitude.max():.1f} km\n"
-    stats_text += f"Ground Range: {ground_range:.1f} km\n"
-    stats_text += f"Duration: {times.max():.1f} s\n"
-    stats_text += f"Points: {len(df)}"
-
-    ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes,
-              fontsize=11, verticalalignment='top',
+    # Stats
+    r_norm = np.sqrt(x**2 + y**2 + z**2)
+    alt_est_km = r_norm - EARTH_RADIUS_MEAN/1000.0
+    text = (
+        f"Origin: lat={np.rad2deg(lat0):.3f}°, lon={np.rad2deg(lon0):.3f}°, h0={h0:.0f} m\n"
+        f"Duration: {t.max():.1f} s, Points: {len(t)}\n"
+        f"Alt est (min/max): {alt_est_km.min():.1f}/{alt_est_km.max():.1f} km"
+    )
+    ax.text2D(0.02, 0.98, text, transform=ax.transAxes, va='top',
               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-    return fig
-
+    plt.tight_layout()
+    plt.show()
 
 def main():
-    """
-    Main conversion routine
-    """
-    print("=" * 60)
-    print("NED to ICRF Trajectory Converter for ez-SMAD")
-    print("=" * 60)
+    # Default input file (user's test path) if none is provided
+    default_in = "/Users/daniele_leuteri/PycharmProjects/ez-SMAD_mk01/exports/target_exports/truth_tracks/ned_test.csv"
 
-    # Input file - change this to your NED file
-    input_file = "/Users/daniele_leuteri/PycharmProjects/ez-SMAD_mk01/exports/target_exports/truth_tracks/ned_test.csv"
+    if len(sys.argv) >= 2:
+        in_csv = sys.argv[1]
+    else:
+        print("No input provided on CLI. Using default test file.")
+        in_csv = default_in
 
-    # Check if file exists
-    if not Path(input_file).exists():
-        print(f"Error: File {input_file} not found!")
-        print("Available CSV files:")
-        for f in Path(".").glob("*.csv"):
-            print(f"  - {f}")
+    if not Path(in_csv).exists():
+        print(f"Error: file not found: {in_csv}")
         sys.exit(1)
 
-    try:
-        # Convert trajectory
-        df = ned_to_icrf(input_file)
+    # Export in the same folder as the input file
+    out_dir = Path(in_csv).parent
 
-        # Create output directory
-        output_dir = Path("exports/targets/truth_trajectory")
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save CSV
-        output_name = Path(input_file).stem
-        output_file = output_dir / f"{output_name}_icrf.csv"
-        df.to_csv(output_file, index=False)
-        print(f"\n✓ Saved to: {output_file}")
-
-        # Print first few rows
-        print(f"\nFirst 5 rows of output:")
-        print(df.head())
-
-        # Create and save 3D plot
-        fig = plot_3d_trajectory(df, title=f"Trajectory: {output_name}")
-        plot_file = output_dir / f"{output_name}_3d.png"
-        fig.savefig(plot_file, dpi=150, bbox_inches='tight')
-        print(f"✓ Saved plot to: {plot_file}")
-
-        # Show plot
-        plt.show()
-
-        print("\n✓ Conversion complete!")
-
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
+    ned_csv_to_ecef_legacy(in_csv, out_dir)
 
 if __name__ == "__main__":
     main()
