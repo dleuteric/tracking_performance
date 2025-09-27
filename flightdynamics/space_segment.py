@@ -1,175 +1,301 @@
+# flightdynamics/space_segment.py
 """
-Space Segment Module - Keplerian Propagator with J2 Perturbations
-Generates satellite ephemeris for multi-layer constellations
-Fast vectorized propagation for architecture trade studies
+Space Segment Module – multi-layer constellation init + propagation + ECEF ephemerides
+- Reads configuration from config.py (EARTH_PARAMS, SPACE_SEGMENT)
+- Initializes Walker layers
+- Propagates with two-body + opzionale drift secolare J2 su RAAN/argomento del perigeo
+- Exports per-satellite ephemerides in ECEF (o ECI) e un manifest della run
 """
+
+from __future__ import annotations
+import os
+import sys
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-import os
-import sys
 
-# Add parent directory to path to import config
+# make parent importable and load config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config
+import config  # noqa: E402
 
 
 class SpaceSegment:
-    """Fast Keplerian propagator for constellation ephemeris generation"""
+    """Keplerian initializer + light propagator for constellation ephemerides."""
 
     def __init__(self):
-        """Initialize space segment from config"""
+        # Config hooks
         self.earth = config.EARTH_PARAMS
-        self.config = config.SPACE_SEGMENT
-        self.satellites = []  # List to store all satellite states
+        self.cfg = config.SPACE_SEGMENT
 
-        # Initialize constellation from config
+        # Satellite list: one dict per sat (keplerian state)
+        self.satellites: list[dict] = []
         self._initialize_constellation()
 
+    # --------------------------
+    # Initialization (unchanged)
+    # --------------------------
     def _initialize_constellation(self):
-        """Create initial satellite states from config layers"""
-        sat_id = 0
+        """Create initial satellite states from config layers."""
+        self.satellites.clear()
 
-        for layer in self.config['layers']:
-            if not layer['enabled']:
+        for layer in self.cfg["layers"]:
+            if not layer.get("enabled", True):
                 continue
 
-            print(f"Initializing {layer['name']}: {layer['total_sats']} satellites")
+            a_km = self.earth["R_E"] + float(layer["altitude_km"])
+            e = float(layer["eccentricity"])
+            i_deg = float(layer["inclination_deg"])
+            omega_deg = float(layer["arg_perigee_deg"])
+            num_planes = int(layer["num_planes"])
+            sats_per_plane = int(layer["sats_per_plane"])
+            phase_off = float(layer.get("phase_offset_deg", 0.0))
 
-            # Convert altitude to semi-major axis
-            a_km = self.earth['R_E'] + layer['altitude_km']  # km
+            for plane_idx in range(num_planes):
+                # RAAN equally spaced
+                raan_deg = (360.0 / num_planes) * plane_idx
 
-            # Generate Walker constellation
-            for plane_idx in range(layer['num_planes']):
-                # RAAN for this plane (uniform spacing)
-                raan_deg = (360.0 / layer['num_planes']) * plane_idx
+                for sat_in_plane in range(sats_per_plane):
+                    # Mean anomaly with intra-plane spacing + optional inter-plane phasing
+                    M_deg = (360.0 / sats_per_plane) * sat_in_plane + phase_off * plane_idx
 
-                for sat_in_plane in range(layer['sats_per_plane']):
-                    # Mean anomaly with inter-plane phasing
-                    M_deg = (360.0 / layer['sats_per_plane']) * sat_in_plane
-                    M_deg += layer['phase_offset_deg'] * plane_idx  # Walker phasing
+                    # ---- ID format requested: Px_Sy (1-based indices) ----
+                    sat_id = f"P{plane_idx+1}_S{sat_in_plane+1}"
 
-                    # Create satellite dictionary
+                    layer_name = layer["name"]
+                    regime = (layer.get("regime") or layer_name.split("_", 1)[0]).upper()
+
                     sat = {
-                        'id': f"{layer['name']}_SAT_{sat_id:03d}",
-                        'layer': layer['name'],
-                        'a_km': a_km,
-                        'e': layer['eccentricity'],
-                        'i_deg': layer['inclination_deg'],
-                        'raan_deg': raan_deg,
-                        'omega_deg': layer['arg_perigee_deg'],
-                        'M_deg': M_deg % 360.0,  # Initial mean anomaly
+                        "regime": regime,
+                        "id": sat_id,
+                        "layer": layer["name"],
+                        "a_km": a_km,
+                        "e": e,
+                        "i_deg": i_deg,
+                        "raan_deg": raan_deg,
+                        "omega_deg": omega_deg,
+                        "M_deg": M_deg % 360.0,
                     }
 
-                    # Convert to Cartesian state (ECI)
-                    r_eci, v_eci = self._keplerian_to_cartesian(
-                        sat['a_km'], sat['e'], sat['i_deg'],
-                        sat['raan_deg'], sat['omega_deg'], sat['M_deg']
+                    # also store initial Cartesian for quick inspection (ECI)
+                    r0, v0 = self._keplerian_to_cartesian(
+                        sat["a_km"], sat["e"], sat["i_deg"],
+                        sat["raan_deg"], sat["omega_deg"], sat["M_deg"]
                     )
-
-                    sat['r_eci'] = r_eci  # km
-                    sat['v_eci'] = v_eci  # km/s
+                    sat["r_eci"] = r0
+                    sat["v_eci"] = v0
 
                     self.satellites.append(sat)
-                    sat_id += 1
 
-        print(f"Total satellites initialized: {len(self.satellites)}")
-
+    # --------------------------
+    # Keplerian -> Cartesian
+    # --------------------------
     def _keplerian_to_cartesian(self, a_km, e, i_deg, raan_deg, omega_deg, M_deg):
         """
-        Convert Keplerian elements to Cartesian state vectors (ECI frame)
-
-        Args:
-            a_km: Semi-major axis [km]
-            e: Eccentricity [-]
-            i_deg: Inclination [degrees]
-            raan_deg: Right Ascension of Ascending Node [degrees]
-            omega_deg: Argument of perigee [degrees]
-            M_deg: Mean anomaly [degrees]
-
-        Returns:
-            r_eci: Position vector [km] in ECI frame
-            v_eci: Velocity vector [km/s] in ECI frame
+        Convert Kepler elements to Cartesian state in ECI.
+        Units: km, km/s, degrees input angles
         """
-        # Convert degrees to radians
+        mu = self.earth["mu"]
+
         i = np.radians(i_deg)
         raan = np.radians(raan_deg)
-        omega = np.radians(omega_deg)
+        argp = np.radians(omega_deg)
         M = np.radians(M_deg)
 
-        # Solve Kepler's equation: M = E - e*sin(E)
-        # Newton-Raphson iteration
-        E = M  # Initial guess
-        for _ in range(10):  # Usually converges in 3-5 iterations
-            E = E - (E - e * np.sin(E) - M) / (1 - e * np.cos(E))
+        # Solve Kepler: M = E - e sin E (Newton)
+        E = M
+        for _ in range(10):
+            f = E - e * np.sin(E) - M
+            fp = 1 - e * np.cos(E)
+            E -= f / fp
 
-        # True anomaly from eccentric anomaly
-        nu = 2 * np.arctan2(
-            np.sqrt(1 + e) * np.sin(E / 2),
-            np.sqrt(1 - e) * np.cos(E / 2)
-        )
+        # True anomaly
+        nu = 2 * np.arctan2(np.sqrt(1 + e) * np.sin(E / 2),
+                            np.sqrt(1 - e) * np.cos(E / 2))
 
-        # Distance from focus
+        # Radius
         r = a_km * (1 - e * np.cos(E))
 
-        # Position in orbital plane
-        r_orbital = r * np.array([np.cos(nu), np.sin(nu), 0])
+        # Perifocal position/velocity
+        x_p = r * np.cos(nu)
+        y_p = r * np.sin(nu)
+        z_p = 0.0
 
-        # Velocity in orbital plane (vis-viva equation)
-        h = np.sqrt(self.earth['mu'] * a_km * (1 - e ** 2))  # Specific angular momentum
-        v_orbital = np.array([
-            -self.earth['mu'] / h * np.sin(nu),
-            self.earth['mu'] / h * (e + np.cos(nu)),
-            0
-        ])
+        h = np.sqrt(mu * a_km * (1 - e**2))
+        vx_p = -mu / h * np.sin(nu)
+        vy_p =  mu / h * (e + np.cos(nu))
+        vz_p = 0.0
 
-        # Rotation matrix from orbital plane to ECI
-        # R = R_z(-Ω) * R_x(-i) * R_z(-ω)
-        cos_raan, sin_raan = np.cos(raan), np.sin(raan)
-        cos_i, sin_i = np.cos(i), np.sin(i)
-        cos_omega, sin_omega = np.cos(omega), np.sin(omega)
+        # Rotation PQW->ECI
+        cO, sO = np.cos(raan), np.sin(raan)
+        ci, si = np.cos(i), np.sin(i)
+        cw, sw = np.cos(argp), np.sin(argp)
 
-        # Combined rotation matrix (orbital to ECI)
         R = np.array([
-            [cos_raan * cos_omega - sin_raan * sin_omega * cos_i,
-             -cos_raan * sin_omega - sin_raan * cos_omega * cos_i,
-             sin_raan * sin_i],
-            [sin_raan * cos_omega + cos_raan * sin_omega * cos_i,
-             -sin_raan * sin_omega + cos_raan * cos_omega * cos_i,
-             -cos_raan * sin_i],
-            [sin_omega * sin_i,
-             cos_omega * sin_i,
-             cos_i]
+            [ cO*cw - sO*sw*ci,  -cO*sw - sO*cw*ci,  sO*si],
+            [ sO*cw + cO*sw*ci,  -sO*sw + cO*cw*ci, -cO*si],
+            [ sw*si,              cw*si,             ci   ]
         ])
-
-        # Transform to ECI frame
-        r_eci = R @ r_orbital
-        v_eci = R @ v_orbital
-
+        r_eci = R @ np.array([x_p, y_p, z_p])
+        v_eci = R @ np.array([vx_p, vy_p, vz_p])
         return r_eci, v_eci
 
-    def test_initialization(self):
-        """Quick test to verify constellation initialization"""
-        print(f"\n{'=' * 50}")
-        print("CONSTELLATION INITIALIZATION TEST")
-        print(f"{'=' * 50}")
+    # --------------------------
+    # Frame conversion
+    # --------------------------
+    def _eci_to_ecef(self, r_eci, v_eci, theta_rad):
+        """ECI->ECEF via rotation about Z and ω×r for velocity."""
+        c, s = np.cos(theta_rad), np.sin(theta_rad)
+        Rz = np.array([[ c, -s, 0.0],
+                       [ s,  c, 0.0],
+                       [0.0, 0.0, 1.0]])
+        r_ecef = Rz @ r_eci
+        omega = np.array([0.0, 0.0, self.earth["omega_E"]])
+        v_ecef = Rz @ v_eci - np.cross(omega, r_ecef)
+        return r_ecef, v_ecef
 
-        # Summary statistics
-        for layer_name in set(sat['layer'] for sat in self.satellites):
-            layer_sats = [s for s in self.satellites if s['layer'] == layer_name]
-            altitudes = [s['a_km'] - self.earth['R_E'] for s in layer_sats]
+    # --------------------------
+    # Propagation + Outputs
+    # --------------------------
+    def propagate(self):
+        """Propagate constellation and write ephemerides + manifest."""
+        prop = self.cfg["propagation"]
+        out = self.cfg["output"]
 
-            print(f"\n{layer_name}:")
-            print(f"  Satellites: {len(layer_sats)}")
-            print(f"  Altitude: {np.mean(altitudes):.1f} km")
-            print(f"  First satellite ID: {layer_sats[0]['id']}")
-            print(f"  Position (ECI): {layer_sats[0]['r_eci']} km")
-            print(f"  |r|: {np.linalg.norm(layer_sats[0]['r_eci']):.1f} km")
-            print(f"  |v|: {np.linalg.norm(layer_sats[0]['v_eci']):.3f} km/s")
+        dt = float(prop.get("timestep_sec", 1.0))
+        Tsec = float(prop.get("duration_min", 30.0)) * 60.0
+        include_J2 = bool(prop.get("include_J2", False))
+        coord_frame = str(out.get("coordinate_frame", "ECEF")).upper()
+        if coord_frame not in ("ECI", "ECEF"):
+            coord_frame = "ECEF"
+
+        # time grid + epoch
+        t_grid = np.arange(0.0, Tsec + 1e-9, dt)
+        t0_utc = datetime.utcnow()
+        epochs = [t0_utc + timedelta(seconds=float(t)) for t in t_grid]
+
+        # output folders
+        base_dir = Path(out.get("ephemeris_dir", "exports/ephemeris/"))
+        run_id = self._run_id(t0_utc)
+        run_dir = base_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        files = {}
+
+        # per-satellite propagation
+        for sat in self.satellites:
+            a = float(sat["a_km"])
+            e = float(sat["e"])
+            i_deg = float(sat["i_deg"])
+            i = np.radians(i_deg)
+            raan0 = np.radians(float(sat["raan_deg"]))
+            argp0 = np.radians(float(sat["omega_deg"]))
+            M0 = np.radians(float(sat["M_deg"]))
+
+            mu = self.earth["mu"]
+            n = np.sqrt(mu / a**3)  # rad/s
+            p = a * (1 - e**2)
+
+            # simple J2 secular drifts (Ωdot, ωdot); Mdot left at n
+            if include_J2:
+                J2 = self.earth["J2"]
+                Re = self.earth["R_E"]
+                fac = (Re**2) / (p**2)
+                O_dot = -1.5 * J2 * fac * n * np.cos(i)
+                w_dot =  0.75 * J2 * fac * n * (5.0 * np.cos(i)**2 - 1.0)
+            else:
+                O_dot = 0.0
+                w_dot = 0.0
+
+            # allocate
+            data = np.zeros((t_grid.size, 7), dtype=float)
+
+            for k, t in enumerate(t_grid):
+                M = M0 + n * t
+                raan = raan0 + O_dot * t
+                argp = argp0 + w_dot * t
+
+                r_eci, v_eci = self._keplerian_to_cartesian(
+                    a, e, i_deg,
+                    np.degrees(raan), np.degrees(argp),
+                    np.degrees(M % (2 * np.pi))
+                )
+
+                if coord_frame == "ECEF":
+                    theta = self.earth["omega_E"] * t  # coarse GMST offset=0
+                    r_xyz, v_xyz = self._eci_to_ecef(r_eci, v_eci, theta)
+                else:
+                    r_xyz, v_xyz = r_eci, v_eci
+
+                data[k, 0] = t
+                data[k, 1:4] = r_xyz
+                data[k, 4:7] = v_xyz
+
+            df = pd.DataFrame(
+                data, columns=["t_sec", "x_km", "y_km", "z_km", "vx_km_s", "vy_km_s", "vz_km_s"]
+            )
+            df.insert(1, "epoch_utc", [ts.isoformat() + "Z" for ts in epochs])
+
+            reg = str(sat.get('regime', 'UNK')).upper()
+            fname = f"{reg}_{sat['id']}.csv"
+            fpath = run_dir / fname
+            df.to_csv(fpath, index=False)
+            files[sat["id"]] = str(Path(fname))
+
+        # manifest
+        manifest = {
+            "run_id": run_id,
+            "created_utc": t0_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "coordinate_frame": coord_frame,
+            "propagation": {
+                "include_J2": include_J2,
+                "timestep_sec": dt,
+                "duration_min": Tsec / 60.0,
+                "method": prop.get("method", "RK4"),
+            },
+            "output": {
+                "root": str(run_dir),
+                "ephemeris_dir": str(base_dir),
+                "file_format": out.get("file_format", "csv"),
+            },
+            "layers": [
+                {
+                    "name": layer["name"],
+                    "enabled": layer.get("enabled", True),
+                    "type": layer.get("type", "walker"),
+                    "total_sats": layer["total_sats"],
+                    "num_planes": layer["num_planes"],
+                    "sats_per_plane": layer["sats_per_plane"],
+                    "altitude_km": layer["altitude_km"],
+                    "inclination_deg": layer["inclination_deg"],
+                    "eccentricity": layer["eccentricity"],
+                    "arg_perigee_deg": layer["arg_perigee_deg"],
+                    "phase_offset_deg": layer.get("phase_offset_deg", 0.0),
+                }
+                for layer in self.cfg["layers"]
+                if layer.get("enabled", True)
+            ],
+            "files": files,
+        }
+
+        man_path = run_dir / f"manifest_{run_id}.json"
+        with open(man_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        print(f"[OK] Ephemerides: {len(files)} files → {run_dir}")
+        print(f"[OK] Manifest   : {man_path}")
+        return {"run_id": run_id, "run_dir": str(run_dir), "manifest": str(man_path)}
+
+    @staticmethod
+    def _run_id(dt_utc: datetime) -> str:
+        return dt_utc.strftime("%Y%m%dT%H%M%SZ")
 
 
-# Test the module
+# --------------------------
+# CLI
+# --------------------------
 if __name__ == "__main__":
-    space_seg = SpaceSegment()
-    space_seg.test_initialization()
+    ss = SpaceSegment()
+    ss.propagate()
